@@ -11,7 +11,7 @@ from ad7606_reader import Ad7606Sample
 from psd_tracker import (
     PsdTrackingController,
     TrackerState,
-    bounded_accumulated_target,
+    feedback_relative_target,
 )
 from tracking_service import PsdTrackingService, _position_step_time_scale
 from raspberrypi_to_pyside import RaspberryPiDeviceServer
@@ -19,8 +19,11 @@ from raspberrypi_to_pyside import RaspberryPiDeviceServer
 
 config_path = Path(__file__).with_name("psd_calibration.json")
 config = json.loads(config_path.read_text(encoding="utf-8"))
-assert config["controller"]["sample_rate_hz"] == 500.0
-assert config["controller"]["command_rate_hz"] == 250.0
+assert config["controller"]["sample_rate_hz"] == 1000.0
+assert config["controller"]["acquisition_backend"] == "thread"
+assert config["controller"]["command_rate_hz"] == 290.0
+assert config["controller"]["control_clock"] == "motor_feedback"
+assert config["controller"]["motor_link_rate_hz"] == 290.0
 assert config["controller"]["position_step_reference_rate_hz"] == 200.0
 assert config["controller"]["status_update_rate_hz"] == 5.0
 assert config["controller"]["status_log_rate_hz"] == 1.0
@@ -29,7 +32,7 @@ assert config["controller"]["motor_feedback_log_rate_hz"] == 1.0
 assert {
     zone["command_rate_hz"]
     for zone in config["controller"]["position_zones"].values()
-} == {250.0}
+} == {290.0}
 assert RaspberryPiDeviceServer.DEFAULT_POLE_PAIRS == 21
 parameter_server = object.__new__(RaspberryPiDeviceServer)
 parameter_server.motors = {
@@ -110,7 +113,7 @@ assert hasattr(RaspberryPiDeviceServer, "_start_motor_position_step_test_async")
 assert hasattr(RaspberryPiDeviceServer, "_start_motor_position_step_test_once_async")
 assert hasattr(RaspberryPiDeviceServer, "_set_canfd_auto_upload")
 assert hasattr(RaspberryPiDeviceServer, "_test_canfd_auto_upload")
-assert hasattr(RaspberryPiDeviceServer, "_send_slcan_and_capture_raw")
+assert hasattr(RaspberryPiDeviceServer, "_observe_upload_phase")
 slcan_buffer = bytearray(b"garbage")
 slcan_frames, slcan_nacks = RaspberryPiDeviceServer._extract_slcan_frames(
     slcan_buffer,
@@ -126,11 +129,15 @@ assert config["controller"]["damping_horizon_s"] == 0.000
 assert config["controller"]["position_zones"]["fine"]["proportional_gain"] == 0.08
 assert config["controller"]["position_zones"]["medium"]["proportional_gain"] == 0.35
 assert config["controller"]["position_zones"]["far"]["proportional_gain"] == 0.55
-assert config["controller"]["prediction_confirm_samples"] == 3
-assert config["controller"]["reversal_confirm_commands"] == 3
-assert config["controller"]["release_confirm_samples"] == 16
-assert config["controller"]["lock_confirm_samples"] == 8
-assert config["controller"]["lost_after_invalid_samples"] == 20
+assert config["controller"]["sample_rate_hz"] == 1000.0
+assert config["controller"]["command_rate_hz"] == 290.0
+assert config["controller"]["motor_link_rate_hz"] == 290.0
+assert config["controller"]["minimum_feedback_rate_hz"] == 250.0
+assert config["controller"]["prediction_confirm_samples"] == 4
+assert config["controller"]["reversal_confirm_commands"] == 4
+assert config["controller"]["release_confirm_samples"] == 19
+assert config["controller"]["lock_confirm_samples"] == 9
+assert config["controller"]["lost_after_invalid_samples"] == 23
 assert config["controller"]["center_hold_min_interval_s"] == 0.250
 clamped_config = deepcopy(config)
 clamped_config["controller"]["position_zones"]["far"]["max_correction_deg"] = 0.060
@@ -214,7 +221,7 @@ assert proportional_update.step_correction_deg == (0.0, -0.006)
 assert proportional_update.control_zone == "medium"
 assert proportional_update.reset_target
 assert 0.003 < proportional_update.max_target_lead_deg < 0.012
-assert proportional_update.command_rate_hz == 250.0
+assert proportional_update.command_rate_hz == 290.0
 assert not proportional_update.prediction_active
 
 fast_controller = PsdTrackingController(logic_config)
@@ -227,7 +234,7 @@ assert fast_update.should_move
 assert fast_update.step_correction_deg == (0.0, -0.030)
 assert fast_update.control_zone == "far"
 assert fast_update.max_target_lead_deg == 0.040
-assert fast_update.command_rate_hz == 250.0
+assert fast_update.command_rate_hz == 290.0
 
 prediction_config = deepcopy(logic_config)
 prediction_config["controller"]["acquire_valid_samples"] = 1
@@ -353,14 +360,14 @@ assert identification_summary["limitation"] == "position_loop_or_filter_limited"
 assert identification_summary["assessment"] == "slow"
 
 assert abs(_position_step_time_scale(1.0 / 250.0, 200.0) - 0.8) < 1e-12
+assert abs(_position_step_time_scale(1.0 / 1000.0, 200.0) - 0.2) < 1e-12
 assert _position_step_time_scale(1.0 / 200.0, 200.0) == 1.0
 assert _position_step_time_scale(1.0 / 100.0, 200.0) == 1.0
 assert abs(_position_step_time_scale(0.001, 200.0) - 0.2) < 1e-12
 
-assert bounded_accumulated_target(0.000, 0.000, 0.010, 0.010) == 0.010
-assert bounded_accumulated_target(0.010, 0.000, 0.010, 0.010) == 0.010
-assert bounded_accumulated_target(0.010, 0.005, 0.010, 0.010) == 0.015
-assert bounded_accumulated_target(0.010, 0.000, -0.006, 0.010) == 0.004
+assert feedback_relative_target(0.000, 0.010, 0.010) == 0.010
+assert feedback_relative_target(0.005, 0.010, 0.010) == 0.015
+assert feedback_relative_target(0.000, -0.006, 0.010) == -0.006
 
 fake_server = object.__new__(RaspberryPiDeviceServer)
 fake_server.motor_transaction_lock = threading.RLock()
@@ -402,6 +409,8 @@ fake_server._motor_tx_timeouts = 0
 fake_server._motor_tx_failures = 0
 fake_server._motor_tx_last_error = None
 fake_server._motor_tx_dropped_batches = 0
+fake_server._motor_tx_rate_hz = 1000.0
+fake_server._motor_link_recoveries = 0
 sent_batches = []
 
 
@@ -429,7 +438,7 @@ pitch_target, yaw_target = RaspberryPiDeviceServer._apply_tracking_step(
 assert sent_batches == [{"motor1": 0.0, "motor2": -0.010}]
 assert pitch_target == 0.0 and yaw_target == -0.010
 RaspberryPiDeviceServer._apply_tracking_step(fake_server, 0.0, -0.010, False)
-assert sent_batches[-1] == {"motor1": 0.0, "motor2": -0.018}
+assert sent_batches[-1] == {"motor1": 0.0, "motor2": -0.010}
 fake_server.current_positions["motor2"] = 0.0
 fake_server.current_targets["motor2"] = 0.0
 RaspberryPiDeviceServer._apply_tracking_step(
@@ -449,7 +458,7 @@ fake_server._motor_feedback_timestamps = {
     "motor2": stale_time,
 }
 fake_server._tracking_active_burst_started_at = stale_time
-fake_server._tracking_last_batch_at = stale_time
+fake_server._tracking_last_batch_at = time.monotonic()
 try:
     RaspberryPiDeviceServer._apply_tracking_step(
         fake_server, 0.001, 0.001, False
@@ -491,6 +500,11 @@ worker_server._motor_tx_condition = threading.Condition()
 worker_server._motor_tx_stop_event = threading.Event()
 worker_server._motor_tx_thread = None
 worker_server._motor_tx_rate_hz = 250.0
+worker_server._motor_link_rate_hz = 250.0
+worker_server._motor_link_keepalive = False
+worker_server._motor_link_watchdog = False
+worker_server._motor_link_last_targets = None
+worker_server._service_link_watchdog = lambda: None
 worker_server._tracking_tx_pending = None
 worker_server._tracking_tx_generation = 0
 worker_server._tracking_tx_sent_generation = 0
@@ -636,6 +650,7 @@ batch_server._last_tracking_write_ms = 0.0
 batch_server._motor_tx_timeouts = 0
 batch_server._motor_tx_dropped_batches = 0
 batch_server._motor_tx_backoff_until = 0.0
+batch_server._motor_link_tx_batches = 0
 batch_server._next_motor_tx_warning = float("inf")
 RaspberryPiDeviceServer._send_tracking_target_batch(
     batch_server,
@@ -771,7 +786,22 @@ def hold_position():
     return position[0], position[1]
 
 
+timer_config = deepcopy(config)
+timer_config["controller"].update(
+    control_clock="timer",
+    acquisition_backend="thread",
+    sample_rate_hz=500.0,
+    command_rate_hz=250.0,
+    filter_alpha=0.18,
+    release_confirm_samples=16,
+    lock_confirm_samples=8,
+    acquire_valid_samples=5,
+    lost_after_invalid_samples=20,
+)
+for zone in timer_config["controller"]["position_zones"].values():
+    zone["command_rate_hz"] = 250.0
 service = PsdTrackingService(config_path, apply_step, hold_position)
+service._load_config = lambda: timer_config
 service._build_reader = lambda unused_config: FakeReader()
 started, message = service.start()
 assert started, message
@@ -799,7 +829,7 @@ assert commands[0][2]
 # Windows' wait granularity is much coarser than RK3588/Linux. The exact
 # 250 Hz deadline is verified from configuration and must be measured on-board;
 # this offline test only guards against a blocked control loop.
-assert status["measured_control_rate_hz"] > 50.0
+assert status["measured_control_rate_hz"] > 20.0
 
 stopped, message = service.stop()
 assert stopped, message

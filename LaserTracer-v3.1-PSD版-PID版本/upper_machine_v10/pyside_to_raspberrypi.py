@@ -1027,7 +1027,7 @@ class RobotNetworkController(QObject):
         })
 
     def benchmarkTrackingRates(self, duration_s=2.0):
-        """安全测速：电机保持当前位置，测PSD/双电机自然吞吐率。"""
+        """测试PSD、电机的极限速率及按配置限速的并行速率。"""
         return self._send_command({
             'device': 'tracking',
             'action': 'benchmark_rates',
@@ -1038,7 +1038,7 @@ class RobotNetworkController(QObject):
         """查电机 CANFD 链路的实时体检结果。
 
         返回最近一个 1 秒窗口里每轴实际收到的帧率、反馈龄期、串口积压、
-        写超时/丢弃、适配器节流复位次数等。用来确认链路真的跑在 1kHz。
+        写超时/丢弃、适配器节流复位次数等。用来确认实际链路频率。
         """
         return self._send_command({
             'device': 'tracking',

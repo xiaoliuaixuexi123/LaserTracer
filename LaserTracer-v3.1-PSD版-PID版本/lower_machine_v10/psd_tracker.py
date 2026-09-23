@@ -53,19 +53,18 @@ def _require_pair(value: Sequence[float], name: str) -> Tuple[float, float]:
     return pair
 
 
-def bounded_accumulated_target(
-    previous_target: float,
+def feedback_relative_target(
     feedback_position: float,
     delta: float,
     max_lead_deg: float,
 ) -> float:
-    """Accumulate one position increment without running ahead of feedback."""
-    values = (previous_target, feedback_position, delta, max_lead_deg)
+    """Apply only this PSD correction to the newest measured motor position."""
+    values = (feedback_position, delta, max_lead_deg)
     if not all(math.isfinite(float(value)) for value in values):
         raise ValueError("tracking target values must be finite")
     if max_lead_deg <= 0.0:
         raise ValueError("max_target_lead_deg must be positive")
-    candidate = float(previous_target) + float(delta)
+    candidate = float(feedback_position) + float(delta)
     lower = float(feedback_position) - float(max_lead_deg)
     upper = float(feedback_position) + float(max_lead_deg)
     return round(min(max(candidate, lower), upper), 6)
@@ -487,6 +486,10 @@ class PsdTrackingController:
             self._error_rate_norm_s = (0.0, 0.0)
             if self._consecutive_invalid >= self.lost_after_invalid_samples:
                 self.state = TrackerState.SIGNAL_LOST
+                # The spot may reappear at a different location after a long
+                # optical dropout. Never blend that fresh reading with the
+                # last position observed before losing the beam.
+                self._filtered_norm = None
             else:
                 self.state = TrackerState.ACQUIRING
             return self._no_move("invalid_psd")
@@ -495,7 +498,9 @@ class PsdTrackingController:
         self._consecutive_valid += 1
         filtered = self._filter((float(x_normalized), float(y_normalized)))
 
-        nominal_dt = 1.0 / self.sample_rate_hz
+        # update() runs on the motor-feedback control clock, not on every PSD
+        # acquisition. Real sample timestamps take precedence below.
+        nominal_dt = 1.0 / self.command_rate_hz
         derivative_dt = nominal_dt
         current_sample_time_s: Optional[float] = None
         if sample_time_s is not None and math.isfinite(float(sample_time_s)):

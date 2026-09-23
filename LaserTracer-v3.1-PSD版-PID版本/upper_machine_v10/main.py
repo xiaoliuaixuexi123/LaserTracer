@@ -1,4 +1,4 @@
-﻿import sys
+import sys
 import time
 import importlib.util
 from pathlib import Path
@@ -48,51 +48,12 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.motor_velocity_mode.setToolTip(
             "V10的PSD闭环使用位置模式；此按钮仅保留给手动速度模式调试"
         )
-        self.query_motor_position_button = QPushButton("查询当前位置", self.tab_6)
-        self.query_motor_position_button.setToolTip(
-            "分别向motor1和motor2发送真实get_status查询，并更新实际俯仰/偏航显示"
+        self.max_rate_test_button = QPushButton("测试PSD和电机频率（约8秒）", self.tab_6)
+        self.max_rate_test_button.setToolTip(
+            "初始化并使能双轴后点击；自动重发原位置目标取得新反馈，"
+            "依次测PSD极限、设定频率并行验证、电机极限和并行极限"
         )
-        self.verticalLayout_3.addWidget(self.query_motor_position_button)
-        self.auto_upload_test_button = QPushButton("核查CANFD上传开关（约14秒）", self.tab_6)
-        self.auto_upload_test_button.setToolTip(
-            "核对参数应答；只测Index06的关闭/开启/关闭。记录原始收发，不发送运动命令；测试后请求关闭上传"
-        )
-        self.verticalLayout_3.addWidget(self.auto_upload_test_button)
-        self.safe_rate_benchmark_button = QPushButton("安全测速（约6秒）", self.tab_6)
-        self.safe_rate_benchmark_button.setToolTip(
-            "需先停止跟踪并查询双轴当前位置；电机保持原位，依次测纯PSD、纯电机和并行吞吐率"
-        )
-        self.verticalLayout_3.addWidget(self.safe_rate_benchmark_button)
-        self.link_metrics_button = QPushButton("链路速率（即时）", self.tab_6)
-        self.link_metrics_button.setToolTip(
-            "查电机CANFD链路最近1秒的真实速率：每轴收到多少帧/秒、反馈龄期、串口积压、"
-            "适配器节流复位次数。不发送运动命令，随时可点，跟踪中也能点"
-        )
-        self.verticalLayout_3.addWidget(self.link_metrics_button)
-        self.link_sampling_button = QPushButton("链路采样：停（点此开）", self.tab_6)
-        self.link_sampling_button.setToolTip(
-            "手动开启电机链路保活采样：用当前实测位置原地保持，之后按配置速率(1kHz)持续收发。"
-            "不启动PSD跟踪也能拿到连续反馈；电机不会动作。再点一次停掉。"
-            "首次点之前请先「电机初始化」+「查询当前位置」"
-        )
-        self.verticalLayout_3.addWidget(self.link_sampling_button)
-        self.link_sampling_on = False
-        self.motor_step_test_button = QPushButton("电机位置环辨识（约45秒）", self.tab_6)
-        self.motor_step_test_button.setToolTip(
-            "停止PSD跟踪后，以固定100Hz对两轴执行0.05°/0.10°/0.20°阶跃，每档3次并返回原位；不会修改PD参数"
-        )
-        self.verticalLayout_3.addWidget(self.motor_step_test_button)
-        self.motor_single_step_test_button = QPushButton(
-            "单次阶跃+自动反馈（约45秒）",
-            self.tab_6,
-        )
-        self.motor_single_step_test_button.setToolTip(
-            "停止PSD跟踪后，每个阶跃只发送1帧位置命令，并被动采集HO7213 CANFD自动上传反馈；测试后关闭自动上传并返回原位"
-        )
-        self.verticalLayout_3.addWidget(self.motor_single_step_test_button)
-        self.stop_motor_step_test_button = QPushButton("停止电机位置环辨识", self.tab_6)
-        self.stop_motor_step_test_button.setEnabled(False)
-        self.verticalLayout_3.addWidget(self.stop_motor_step_test_button)
+        self.verticalLayout_3.addWidget(self.max_rate_test_button)
         # self.controller = RobotNetworkController(host=self.socket_connection.text(), port="8888")
         self.controller = None
         self.pending_pitch = None
@@ -381,16 +342,7 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         self.start_tracking.clicked.connect(self.startPsdTracking)
         self.stop_tracking.clicked.connect(self.stopPsdTracking)
         self.read_currunt_position.clicked.connect(self.save_current_position)
-        self.query_motor_position_button.clicked.connect(self.queryCurrentMotorPositions)
-        self.auto_upload_test_button.clicked.connect(self.runCanfdAutoUploadTest)
-        self.safe_rate_benchmark_button.clicked.connect(self.runSafeRateBenchmark)
-        self.link_metrics_button.clicked.connect(self.runLinkMetricsQuery)
-        self.link_sampling_button.clicked.connect(self.toggleLinkSampling)
-        self.motor_step_test_button.clicked.connect(self.runMotorPositionStepTest)
-        self.motor_single_step_test_button.clicked.connect(
-            self.runMotorPositionSingleStepTest
-        )
-        self.stop_motor_step_test_button.clicked.connect(self.stopMotorPositionStepTest)
+        self.max_rate_test_button.clicked.connect(self.runMaxRateTest)
         self.delete_last_line.clicked.connect(self.delete_last_position_fc)
         self.laser_processor.raw_data_received.connect(self.on_laser_raw_data)
         self.laser_processor.processed_result.connect(self.on_laser_processed)
@@ -414,263 +366,19 @@ class MainWindow(QMainWindow, Ui_MainWindow):
         print(f"已保存当前位置到 {txt_path}: {self.position_counter} {pitch} {yaw}")
         self.position_counter += 1
 
-    def queryCurrentMotorPositions(self):
-        """向两台电机发送真实状态查询，不使用上位机缓存。"""
+    def runMaxRateTest(self):
+        """测PSD、双轴命令应答及并行运行的实际最大频率。"""
         if self.controller is None:
-            print("⚠️ 下位机未连接，无法查询当前位置")
-            self.statusbar.showMessage("下位机未连接，无法查询当前位置", 5000)
+            self.statusbar.showMessage("下位机未连接，无法测速", 5000)
             return
-        pitch_sent = self.controller.getMotorStatus('motor1')
-        yaw_sent = self.controller.getMotorStatus('motor2')
-        if pitch_sent and yaw_sent:
-            print("=== 已发送双轴当前位置查询 ===")
-            self.statusbar.showMessage("已发送双轴当前位置查询，等待反馈", 5000)
-        else:
-            print("⚠️ 当前位置查询发送失败")
-            self.statusbar.showMessage("当前位置查询发送失败", 5000)
-
-    def runCanfdAutoUploadTest(self):
-        """不运行PSD、不重复发位置命令，纯接收验证1ms主动上传。"""
-        if self.controller is None:
-            print("⚠️ 下位机未连接，无法测试CANFD自动上传")
-            self.statusbar.showMessage("下位机未连接，无法测试CANFD自动上传", 5000)
-            return
-        self.auto_upload_test_button.setEnabled(False)
+        self.max_rate_test_button.setEnabled(False)
         self.start_tracking.setEnabled(False)
-        sent = self.controller.testCanfdAutoUpload(duration_s=1.0)
-        if sent:
-            self.statusbar.showMessage("CANFD自动上传安全测试中：电机保持原位…")
+        if self.controller.benchmarkTrackingRates(duration_s=2.0):
+            self.statusbar.showMessage("正在测速：PSD极限、设定并行、电机极限和并行极限各约2秒…")
             return
-        self.auto_upload_test_button.setEnabled(True)
+        self.max_rate_test_button.setEnabled(True)
         self.start_tracking.setEnabled(True)
-        self.statusbar.showMessage("CANFD自动上传测试命令发送失败", 5000)
-
-    def runSafeRateBenchmark(self):
-        """运行三阶段无软件限频测速，电机始终保持当前位置。"""
-        if self.controller is None:
-            print("⚠️ 下位机未连接，无法运行安全测速")
-            self.statusbar.showMessage("下位机未连接，无法运行安全测速", 5000)
-            return
-        pitch_sent = self.controller.getMotorStatus('motor1')
-        yaw_sent = self.controller.getMotorStatus('motor2')
-        if not (pitch_sent and yaw_sent):
-            self.statusbar.showMessage("安全测速前双轴位置查询失败", 5000)
-            return
-        self.safe_rate_benchmark_button.setEnabled(False)
-        self.motor_step_test_button.setEnabled(False)
-        self.motor_single_step_test_button.setEnabled(False)
-        self.start_tracking.setEnabled(False)
-        self.statusbar.showMessage("安全测速准备中：正在确认双轴当前位置…")
-        QTimer.singleShot(1000, self._startSafeRateBenchmark)
-
-    def _startSafeRateBenchmark(self):
-        if self.controller is None:
-            self.safe_rate_benchmark_button.setEnabled(True)
-            self.motor_step_test_button.setEnabled(True)
-            self.motor_single_step_test_button.setEnabled(True)
-            self.start_tracking.setEnabled(True)
-            return
-        sent = self.controller.benchmarkTrackingRates(duration_s=2.0)
-        if sent:
-            self.statusbar.showMessage("安全测速运行中：PSD/电机/并行各2秒…")
-            return
-        self.safe_rate_benchmark_button.setEnabled(True)
-        self.motor_step_test_button.setEnabled(True)
-        self.motor_single_step_test_button.setEnabled(True)
-        self.start_tracking.setEnabled(True)
-        self.statusbar.showMessage("安全测速命令发送失败", 5000)
-
-    def runLinkMetricsQuery(self):
-        """查一次电机 CANFD 链路的实时速率。
-
-        和「安全测速」不同：它不改任何东西、不等 6 秒、跟踪中也能点，
-        返回的是最近一个 1 秒窗口里**实际**收到的帧率，用来确认链路真在 1kHz。
-        """
-        if self.controller is None:
-            print("⚠️ 下位机未连接，无法查询链路速率")
-            self.statusbar.showMessage("下位机未连接，无法查询链路速率", 5000)
-            return
-        if self.controller.getLinkMetrics():
-            self.statusbar.showMessage("链路速率查询中…", 3000)
-            return
-        self.statusbar.showMessage("链路速率查询命令发送失败", 5000)
-
-    @staticmethod
-    def _formatLinkMetrics(data):
-        """把链路体检结果排成一行给状态栏/日志用，并直接给一句结论。"""
-        data = data or {}
-        rx = data.get('rx_hz') or {}
-        age = data.get('feedback_age_ms') or {}
-        rate = float(data.get('link_rate_hz') or 0.0)
-        tx = data.get('tx_batch_hz')
-        limited = data.get('rate_limited_hz')
-
-        def _f(value, fmt='{:.0f}'):
-            return '—' if value is None else fmt.format(value)
-
-        pitch, yaw = rx.get('motor1'), rx.get('motor2')
-        try:
-            low = min(float(pitch or 0), float(yaw or 0))
-        except (TypeError, ValueError):
-            low = 0.0
-
-        parts = [
-            f"链路速率：pitch {_f(pitch)}Hz / yaw {_f(yaw)}Hz"
-            f"（目标 {rate:.0f}Hz，实发 {_f(tx)}Hz/轴）",
-            f"窗口 {data.get('window_s') or 0:.2f}s",
-            f"反馈龄期 {_f(age.get('motor1'), '{:.1f}')}/"
-            f"{_f(age.get('motor2'), '{:.1f}')}ms",
-            f"积压 {data.get('serial_backlog_bytes', 0)}B",
-            # 单次串口写耗时：如果接近甚至超过 1/目标 周期(1kHz->1ms)，
-            # 说明瓶颈在宿主侧 USB CDC 写延迟，不在 CAN 总线 / 电机。
-            f"写耗时 {_f(data.get('last_write_ms'), '{:.2f}')}ms",
-            f"写超时 {data.get('tx_timeouts', 0)}",
-            f"丢弃 {data.get('dropped_batches', 0)}",
-            f"解析错误 {data.get('parse_errors', 0)}",
-            f"复位 {data.get('recoveries', 0)}",
-        ]
-
-        verdict = None
-        if not data.get('keepalive_armed'):
-            verdict = "保活未 arm：当前没有在发目标"
-        elif limited:
-            verdict = (
-                f"⚠ 看门狗已判定这是吞吐上限：复位试过了、救不回来（只有 "
-                f"{limited:.0f}Hz/轴）。把 psd_calibration.json 的 motor_link_rate_hz "
-                f"从 {rate:.0f} 降到 {max(50.0, limited * 0.8):.0f} 左右再试 —— "
-                f"继续要 1kHz 也上不去"
-            )
-        elif low < rate * 0.9:
-            verdict = (
-                f"速率偏低（{low:.0f}Hz/轴），看门狗正在试复位并观察；"
-                f"若它随后报'判定为吞吐上限'，那就是链路/电机撑不住"
-            )
-        elif tx is not None:
-            verdict = "正常"
-        if verdict:
-            parts.append(f"→ {verdict}")
-        return " | ".join(parts)
-
-    def _setLinkSamplingState(self, on):
-        """同步"链路采样"按钮的文字与本地状态。"""
-        self.link_sampling_on = bool(on)
-        if self.link_sampling_on:
-            self.link_sampling_button.setText("链路采样：已开（点此停）")
-        else:
-            self.link_sampling_button.setText("链路采样：停（点此开）")
-
-    def toggleLinkSampling(self):
-        """手动开关链路保活采样（不跑 PSD 跟踪也能按 1kHz 收反馈）。"""
-        if self.controller is None:
-            print("⚠️ 下位机未连接，无法切换链路采样")
-            self.statusbar.showMessage("下位机未连接，无法切换链路采样", 5000)
-            return
-        wanted = not getattr(self, 'link_sampling_on', False)
-        if self.controller.setLinkSampling(wanted):
-            self.statusbar.showMessage(
-                "链路采样开启中（用当前实测位置原地保持）…" if wanted
-                else "链路采样停止中…",
-                5000,
-            )
-            return
-        self.statusbar.showMessage("链路采样命令发送失败", 5000)
-
-    def runMotorPositionStepTest(self):
-        """逐轴执行小位置阶跃，判断HO7213内部位置环响应。"""
-        if self.controller is None:
-            print("⚠️ 下位机未连接，无法运行电机位置环测试")
-            self.statusbar.showMessage("下位机未连接，无法运行电机位置环测试", 5000)
-            return
-        pitch_sent = self.controller.getMotorStatus('motor1')
-        yaw_sent = self.controller.getMotorStatus('motor2')
-        if not (pitch_sent and yaw_sent):
-            self.statusbar.showMessage("位置环测试前双轴位置查询失败", 5000)
-            return
-        self.motor_step_test_button.setEnabled(False)
-        self.motor_single_step_test_button.setEnabled(False)
-        self.stop_motor_step_test_button.setEnabled(False)
-        self.safe_rate_benchmark_button.setEnabled(False)
-        self.start_tracking.setEnabled(False)
-        self.statusbar.showMessage("位置环测试准备中：正在确认双轴当前位置…")
-        QTimer.singleShot(1000, self._startMotorPositionStepTest)
-
-    def _startMotorPositionStepTest(self):
-        if self.controller is None:
-            self.motor_step_test_button.setEnabled(True)
-            self.motor_single_step_test_button.setEnabled(True)
-            self.stop_motor_step_test_button.setEnabled(False)
-            self.safe_rate_benchmark_button.setEnabled(True)
-            self.start_tracking.setEnabled(True)
-            return
-        sent = self.controller.testMotorPositionLoop(
-            step_degrees=(0.05, 0.10, 0.20),
-            repeats=3,
-            duration_s=1.2,
-            command_rate_hz=100.0,
-        )
-        if sent:
-            self.stop_motor_step_test_button.setEnabled(True)
-            self.statusbar.showMessage(
-                "电机位置环辨识中：固定100Hz、多幅值、每档3次…"
-            )
-            return
-        self.motor_step_test_button.setEnabled(True)
-        self.motor_single_step_test_button.setEnabled(True)
-        self.stop_motor_step_test_button.setEnabled(False)
-        self.safe_rate_benchmark_button.setEnabled(True)
-        self.start_tracking.setEnabled(True)
-        self.statusbar.showMessage("电机位置环测试命令发送失败", 5000)
-
-    def runMotorPositionSingleStepTest(self):
-        """单次下发目标，并通过HO7213 CANFD自动上传测量响应。"""
-        if self.controller is None:
-            print("⚠️ 下位机未连接，无法运行单次阶跃测试")
-            self.statusbar.showMessage("下位机未连接，无法运行单次阶跃测试", 5000)
-            return
-        pitch_sent = self.controller.getMotorStatus('motor1')
-        yaw_sent = self.controller.getMotorStatus('motor2')
-        if not (pitch_sent and yaw_sent):
-            self.statusbar.showMessage("单次阶跃测试前双轴位置查询失败", 5000)
-            return
-        self.motor_step_test_button.setEnabled(False)
-        self.motor_single_step_test_button.setEnabled(False)
-        self.stop_motor_step_test_button.setEnabled(False)
-        self.safe_rate_benchmark_button.setEnabled(False)
-        self.start_tracking.setEnabled(False)
-        self.statusbar.showMessage("单次阶跃测试准备中：正在确认双轴当前位置…")
-        QTimer.singleShot(1000, self._startMotorPositionSingleStepTest)
-
-    def _startMotorPositionSingleStepTest(self):
-        if self.controller is None:
-            self.motor_step_test_button.setEnabled(True)
-            self.motor_single_step_test_button.setEnabled(True)
-            self.stop_motor_step_test_button.setEnabled(False)
-            self.safe_rate_benchmark_button.setEnabled(True)
-            self.start_tracking.setEnabled(True)
-            return
-        sent = self.controller.testMotorPositionLoopOnce(
-            step_degrees=(0.05, 0.10, 0.20),
-            repeats=3,
-            duration_s=1.2,
-        )
-        if sent:
-            self.stop_motor_step_test_button.setEnabled(True)
-            self.statusbar.showMessage(
-                "单次阶跃辨识中：每阶段只发1帧位置命令，被动采集自动反馈…"
-            )
-            return
-        self.motor_step_test_button.setEnabled(True)
-        self.motor_single_step_test_button.setEnabled(True)
-        self.stop_motor_step_test_button.setEnabled(False)
-        self.safe_rate_benchmark_button.setEnabled(True)
-        self.start_tracking.setEnabled(True)
-        self.statusbar.showMessage("单次阶跃测试命令发送失败", 5000)
-
-    def stopMotorPositionStepTest(self):
-        if self.controller is None:
-            return
-        if self.controller.stopMotorPositionLoopTest():
-            self.statusbar.showMessage("正在停止电机位置环辨识并返回原位…", 5000)
+        self.statusbar.showMessage("测速命令发送失败", 5000)
 
     def delete_last_position_fc(self):
         txt_path = Path(__file__).resolve().parent / "current_position.txt"
@@ -951,6 +659,18 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                     self.actual_pitch_angle.setText(str(data['position']))
         if response.get('message'):
             print(f"消息: {response.get('message')}")
+        if (
+            response.get('device') == 'motor'
+            and response.get('action') == 'get_status'
+            and isinstance(response.get('data'), dict)
+        ):
+            age_ms = response['data'].get('feedback_age_ms')
+            if isinstance(age_ms, (int, float)) and age_ms > 50.0:
+                self.statusbar.showMessage(
+                    f"{response['data'].get('id', '电机')}反馈已过期"
+                    f"（{age_ms:.1f} ms）；测速或跟踪启动时将自动尝试更新反馈",
+                    8000,
+                )
         if response.get('device') == 'tracking':
             action = response.get('action')
             status = response.get('status')
@@ -963,161 +683,42 @@ class MainWindow(QMainWindow, Ui_MainWindow):
                 self.start_tracking.setEnabled(True)
                 self.stop_tracking.setEnabled(False)
                 self.statusbar.showMessage(f"PSD跟踪已停止：{message}", 5000)
-            elif status == 'success' and action == 'test_canfd_auto_upload':
-                self.auto_upload_test_button.setEnabled(True)
+            elif action == 'benchmark_rates':
+                self.max_rate_test_button.setEnabled(True)
                 self.start_tracking.setEnabled(True)
-                motors = (response.get('data') or {}).get('motors', {})
-                summaries = []
-                for motor_id, label in (('motor1', 'pitch'), ('motor2', 'yaw')):
-                    result = motors.get(motor_id, {})
-                    summaries.append(
-                        f"{label}={result.get('estimated_auto_upload_hz', 0):.1f}Hz/"
-                        f"{result.get('assessment', 'unknown')}/"
-                        f"{result.get('selected_variant') or '尚未证实周期上传'}"
-                    )
-                summary = "CANFD自动上传测试：" + "，".join(summaries)
-                print(summary)
-                self.statusbar.showMessage(summary, 20000)
-            elif status == 'success' and action == 'benchmark_rates':
-                self.safe_rate_benchmark_button.setEnabled(True)
-                self.motor_step_test_button.setEnabled(True)
-                self.motor_single_step_test_button.setEnabled(True)
-                self.start_tracking.setEnabled(True)
-                data = response.get('data') or {}
-                psd_only = data.get('psd_only', {})
-                motor_only = data.get('motor_only', {})
-                combined = data.get('combined', {})
-                combined_psd = combined.get('psd', {})
-                combined_motor = combined.get('motor', {})
-                summary = (
-                    f"安全测速完成：PSD {psd_only.get('sample_hz', 0):.1f}Hz，"
-                    f"电机 {motor_only.get('completed_pair_hz', 0):.1f}Hz，"
-                    f"并行 PSD/电机 {combined_psd.get('sample_hz', 0):.1f}/"
-                    f"{combined_motor.get('completed_pair_hz', 0):.1f}Hz"
-                )
-                print(summary)
-                self.statusbar.showMessage(summary, 15000)
-            elif status == 'error' and action == 'get_link_metrics':
-                message = response.get('message') or '链路速率查询失败'
-                print(f"⚠️ 链路速率查询失败：{message}")
-                self.statusbar.showMessage(f"链路速率查询失败：{message}", 6000)
-            elif action == 'get_link_metrics':
-                summary = self._formatLinkMetrics(response.get('data'))
-                print(summary)
-                self.statusbar.showMessage(summary, 15000)
-                # 用服务端的真实状态同步按钮文字，避免本地状态漂移
-                if isinstance(response.get('data'), dict):
-                    self._setLinkSamplingState(
-                        response['data'].get('keepalive_armed', False)
-                    )
-            elif status == 'success' and action == 'set_link_sampling':
-                data = response.get('data') or {}
-                self._setLinkSamplingState(data.get('on', False))
-                if data.get('on'):
-                    hold = data.get('hold_targets_deg') or {}
-                    text = (f"链路采样已开启（原地保持 pitch="
-                            f"{hold.get('motor1', 0):.4f}° yaw="
-                            f"{hold.get('motor2', 0):.4f}°）"
-                            "；等 1 秒后点「链路速率（即时）」看速率")
+                if status == 'success':
+                    data = response.get('data') or {}
+                    psd_only = data.get('psd_only', {})
+                    motor_only = data.get('motor_only', {})
+                    combined = data.get('combined', {})
+                    configured = data.get('configured', {})
+                    configured_psd = configured.get('psd', {})
+                    configured_motor = configured.get('motor', {})
+                    combined_psd = combined.get('psd', {})
+                    combined_motor = combined.get('motor', {})
+                    if not configured:
+                        summary = "下位机未返回设定频率并行结果，请部署v22下位机与新配置"
+                    else:
+                        summary = (
+                            f"设定并行PSD/双轴TX/RX "
+                            f"{configured_psd.get('sample_hz', 0):.1f}/"
+                            f"{configured_motor.get('tx_pair_hz', 0):.1f}/"
+                            f"{configured_motor.get('completed_pair_hz', 0):.1f}Hz"
+                            f"（{'达标' if configured.get('meets_target') else '未达标'}）；"
+                            f"极限PSD {psd_only.get('sample_hz', 0):.1f}Hz，"
+                            f"电机发/收 {motor_only.get('tx_pair_hz', 0):.1f}/"
+                            f"{motor_only.get('completed_pair_hz', 0):.1f}Hz，"
+                            f"并行 {combined_psd.get('sample_hz', 0):.1f}/"
+                            f"{combined_motor.get('completed_pair_hz', 0):.1f}Hz"
+                        )
+                    print(summary)
+                    self.statusbar.showMessage(summary, 20000)
                 else:
-                    text = "链路采样已停止"
-                print(text)
-                self.statusbar.showMessage(text, 15000)
-            elif status == 'error' and action == 'set_link_sampling':
-                message = response.get('message') or '链路采样切换失败'
-                print(f"⚠️ 链路采样切换失败：{message}")
-                self.statusbar.showMessage(f"链路采样切换失败：{message}", 8000)
-            elif status == 'started' and action in (
-                'test_motor_position_loop',
-                'test_motor_position_loop_once',
-            ):
-                self.stop_motor_step_test_button.setEnabled(True)
-                estimated = (response.get('data') or {}).get('estimated_duration_s', 45)
-                mode_text = (
-                    "单次命令+自动反馈"
-                    if action == 'test_motor_position_loop_once'
-                    else "固定100Hz重复命令"
-                )
-                self.statusbar.showMessage(
-                    f"电机位置环辨识已启动（{mode_text}），预计约{estimated}秒…"
-                )
-            elif status == 'success' and action in (
-                'test_motor_position_loop',
-                'test_motor_position_loop_once',
-            ):
-                self.motor_step_test_button.setEnabled(True)
-                self.motor_single_step_test_button.setEnabled(True)
-                self.stop_motor_step_test_button.setEnabled(False)
-                self.safe_rate_benchmark_button.setEnabled(True)
-                self.start_tracking.setEnabled(True)
-                data = response.get('data') or {}
-                motors = data.get('motors', {})
-                summaries = []
-                for motor_id, label in (('motor1', 'pitch'), ('motor2', 'yaw')):
-                    result = motors.get(motor_id, {})
-                    result_summary = result.get('summary', {})
-                    by_amplitude = result_summary.get('by_amplitude', {})
-                    smallest_step = by_amplitude.get('0.050', {})
-                    latency_text = (
-                        f"{smallest_step.get('median_command_to_first_feedback_ms')}/"
-                        f"{smallest_step.get('median_first_motion_latency_ms')}ms"
-                    )
-                    t10_text = '/'.join(
-                        str(by_amplitude.get(key, {}).get('median_rise_time_10_ms'))
-                        for key in ('0.050', '0.100', '0.200')
-                    )
-                    t90_text = '/'.join(
-                        str(by_amplitude.get(key, {}).get('median_rise_time_90_ms'))
-                        for key in ('0.050', '0.100', '0.200')
-                    )
-                    summary = (
-                        f"{label}: Kp/Kd={result.get('configured_Kp')}/"
-                        f"{result.get('configured_Kd')}，"
-                        f"速度={result.get('configured_velocity_rad_s')}rad/s，"
-                        f"0.05°首反馈/首动={latency_text}，"
-                        f"0.05/0.10/0.20°中位t10={t10_text}ms、"
-                        f"t90={t90_text}ms，"
-                        f"限制={result_summary.get('limitation', 'unknown')}，"
-                        f"判断={result.get('assessment', 'unknown')}"
-                    )
-                    summaries.append(summary)
-                    log_label = (
-                        "电机单次阶跃"
-                        if action == 'test_motor_position_loop_once'
-                        else "电机位置环辨识"
-                    )
-                    print(f"[{log_label}] {summary}")
-                status_summary = "；".join(summaries)
-                completion_label = (
-                    "单次阶跃辨识"
-                    if action == 'test_motor_position_loop_once'
-                    else "电机位置环辨识"
-                )
-                self.statusbar.showMessage(
-                    f"{completion_label}完成：{status_summary}",
-                    30000,
-                )
-            elif status == 'success' and action == 'stop_motor_position_loop_test':
-                self.statusbar.showMessage(f"位置环辨识停止请求：{message}", 5000)
+                    self.statusbar.showMessage(f"最大频率测试失败：{message}", 10000)
             elif status in ('error', 'cancelled'):
                 self.start_tracking.setEnabled(True)
                 self.stop_tracking.setEnabled(True)
-                self.auto_upload_test_button.setEnabled(True)
-                self.safe_rate_benchmark_button.setEnabled(True)
-                self.motor_step_test_button.setEnabled(True)
-                self.motor_single_step_test_button.setEnabled(True)
-                self.stop_motor_step_test_button.setEnabled(False)
-                operation = {
-                    'test_canfd_auto_upload': "CANFD自动上传测试",
-                    'benchmark_rates': "安全测速",
-                    'test_motor_position_loop': "电机位置环辨识",
-                    'test_motor_position_loop_once': "单次阶跃辨识",
-                }.get(action, "PSD跟踪")
-                result_text = "已取消" if status == 'cancelled' else "失败"
-                self.statusbar.showMessage(
-                    f"{operation}{result_text}：{message}",
-                    10000,
-                )
+                self.statusbar.showMessage(f"PSD跟踪失败：{message}", 10000)
         print()
 
     def on_error(self, error_msg):
@@ -1125,6 +726,8 @@ class MainWindow(QMainWindow, Ui_MainWindow):
 
     def on_disconnected(self):
         self.stop_realtime_wmps_guidance()
+        self.max_rate_test_button.setEnabled(True)
+        self.start_tracking.setEnabled(True)
         print("=== 断开连接成功 ===")
 
     def on_laser_raw_data(self, data_line):

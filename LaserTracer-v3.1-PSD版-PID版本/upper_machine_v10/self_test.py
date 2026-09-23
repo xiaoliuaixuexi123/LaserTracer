@@ -25,14 +25,7 @@ main_methods = class_methods(main_path, "MainWindow")
 network_methods = class_methods(network_path, "RobotNetworkController")
 
 assert {
-    "queryCurrentMotorPositions",
-    "runSafeRateBenchmark",
-    "_startSafeRateBenchmark",
-    "runMotorPositionStepTest",
-    "_startMotorPositionStepTest",
-    "runMotorPositionSingleStepTest",
-    "_startMotorPositionSingleStepTest",
-    "stopMotorPositionStepTest",
+    "runMaxRateTest",
     "save_current_position",
     "sendMotorMessage",
     "startPsdTracking",
@@ -60,19 +53,19 @@ assert {
 }.issubset(network_methods)
 
 source = main_path.read_text(encoding="utf-8-sig")
-assert "self.controller.getMotorStatus('motor1')" in source
-assert "self.controller.getMotorStatus('motor2')" in source
-assert "查询当前位置" in source
-assert "安全测速（约6秒）" in source
-assert "电机位置环辨识（约45秒）" in source
-assert "单次阶跃+自动反馈（约45秒）" in source
+assert "query_motor_position_button" not in source
+assert "测试PSD和电机频率（约8秒）" in source
+assert "核查CANFD上传开关（约14秒）" not in source
+assert "链路采样：停（点此开）" not in source
+assert "电机位置环辨识（约45秒）" not in source
+assert "单次阶跃+自动反馈（约45秒）" not in source
 assert "V10位置跟踪版" in source
 assert source.count("pole_pairs=21") >= 2
 assert source.count("model='HO7213'") >= 2
 assert "Kp=0x06, Kd=0xF0, velocity=2, currency=3" in source
 assert "Kp=0x10, Kd=0xA0, velocity=2, currency=3" in source
-assert "'motor1', Kp=0x18, Kd=0xD0, velocity=2, currency=3" in source
-assert "'motor2', Kp=0x0E, Kd=0x70, velocity=2, currency=3" in source
+assert "'motor1', Kp=0x1E, Kd=0xD2, velocity=2, currency=2" in source
+assert "'motor2', Kp=0x1C, Kd=0x80, velocity=2, currency=2" in source
 
 network_source = network_path.read_text(encoding="utf-8-sig")
 assert "pole_pairs=21" in network_source

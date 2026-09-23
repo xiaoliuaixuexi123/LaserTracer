@@ -9,16 +9,20 @@ from pathlib import Path
 
 try:
     from .tracking_service import PsdTrackingService
-    from .psd_tracker import bounded_accumulated_target
+    from .psd_acquisition_process import PsdAcquisitionProcess
+    from .psd_tracker import feedback_relative_target
+    from .canfd_upload_diagnostics import UploadObservation, verify_upload_cycle
 except ImportError:
     from tracking_service import PsdTrackingService
-    from psd_tracker import bounded_accumulated_target
+    from psd_acquisition_process import PsdAcquisitionProcess
+    from psd_tracker import feedback_relative_target
+    from canfd_upload_diagnostics import UploadObservation, verify_upload_cycle
 
 
 class RaspberryPiDeviceServer:
     """RK3588下位机：接收JSON命令并控制电机和激光测距仪。"""
 
-    SOFTWARE_BUILD = '2026-09-22-command-reply-v14'
+    SOFTWARE_BUILD = '2026-09-23-feedback-clock-1k290-thread-v22'
     CANFD_DLC_16 = 'A'
     CANFD_FRAME_SIZE = 64
     CANFD_POSITION_COUNTS_PER_REV = 1048576
@@ -71,6 +75,9 @@ class RaspberryPiDeviceServer:
         self._motor_rx_stop_event = threading.Event()
         self._motor_rx_thread = None
         self._motor_feedback_modes = {}
+        self._motor_auto_upload_variants = {}
+        self._motor_auto_upload_enabled = {}
+        self._motor_diagnostic_capture = None
         # Serial RX must never perform TCP writes.  A second worker publishes
         # only the newest cached feedback at a bounded rate, so a slow upper
         # machine cannot stall CANFD reception.
@@ -86,6 +93,34 @@ class RaspberryPiDeviceServer:
         self._motor_tx_stop_event = threading.Event()
         self._motor_tx_thread = None
         self._motor_tx_rate_hz = 250.0
+        # --- CANFD 链路采样（与上面的控制周期解耦，见 _motor_tx_loop 的说明）---
+        # 链路按配置每台 290Hz 跑：即使控制环这一拍没有新目标，也把上一组目标
+        # 原样重发一次，用来换取连续的反馈流。位置模式下发同一个设定值是空操作。
+        self._motor_link_rate_hz = 290.0
+        self._tracking_command_rate_hz = 250.0
+        self._tracking_min_feedback_rate_hz = 250.0
+        self._tracking_control_clock = 'timer'
+        self._motor_link_keepalive = True
+        self._motor_link_watchdog = True
+        self._motor_link_watchdog_min_ratio = 0.8
+        self._motor_link_last_targets = None
+        self._motor_link_keepalive_pause_depth = 0
+        self._motor_link_last_send_at = 0.0
+        self._motor_link_recoveries = 0
+        self._motor_link_low_windows = 0
+        self._motor_link_probe_at = time.monotonic()
+        self._motor_link_probe_reset_pending = False
+        self._motor_link_probe_counts = {}
+        self._motor_link_last_rates = {}
+        self._motor_link_last_rates_at = 0.0
+        self._motor_link_last_window_s = 0.0
+        self._motor_link_last_tx_hz = 0.0
+        self._motor_link_tx_batches = 0
+        self._motor_link_probe_tx = 0
+        self._motor_link_bounce_probe_until = 0.0
+        self._motor_link_limited_hz = None
+        self._motor_link_limit_log_at = 0.0
+        self._motor_link_last_bounce_at = 0.0
         self._tracking_tx_pending = None
         self._tracking_tx_generation = 0
         self._tracking_tx_sent_generation = 0
@@ -178,6 +213,31 @@ class RaspberryPiDeviceServer:
             self._motor_tx_rate_hz = float(
                 tracking_controller.get('command_rate_hz', self._motor_tx_rate_hz)
             )
+            self._tracking_command_rate_hz = self._motor_tx_rate_hz
+            self._tracking_min_feedback_rate_hz = float(
+                tracking_controller.get('minimum_feedback_rate_hz', 250.0)
+            )
+            self._tracking_control_clock = str(
+                tracking_controller.get('control_clock', 'timer')
+            )
+            # 链路采样率与控制器指令周期解耦。控制器仍然按 command_rate_hz
+            # 产出新目标（tracking_service 直接读这个键，不受这里影响），
+            # 而电机串口按 motor_link_rate_hz 保持不停地收发。
+            self._motor_link_rate_hz = float(
+                tracking_controller.get(
+                    'motor_link_rate_hz',
+                    tracking_controller.get('motor_feedback_poll_rate_hz', 290.0),
+                )
+            )
+            self._motor_link_keepalive = bool(
+                tracking_controller.get('motor_link_keepalive', True)
+            )
+            self._motor_link_watchdog = bool(
+                tracking_controller.get('motor_link_watchdog', True)
+            )
+            self._motor_link_watchdog_min_ratio = float(
+                tracking_controller.get('motor_link_watchdog_min_ratio', 0.8)
+            )
             self.MOTOR_FEEDBACK_POLL_S = float(
                 tracking_controller.get(
                     'motor_feedback_poll_s', self.MOTOR_FEEDBACK_POLL_S
@@ -228,9 +288,14 @@ class RaspberryPiDeviceServer:
                 self.MOTOR_FEEDBACK_POLL_S,
                 feedback_log_rate_hz,
                 self._motor_tx_rate_hz,
+                self._motor_link_rate_hz,
                 self._motor_feedback_publish_rate_hz,
             ) <= 0.0:
                 raise ValueError('motor feedback timing values must be positive')
+            if not 0.0 < self._motor_link_watchdog_min_ratio < 1.0:
+                raise ValueError('motor_link_watchdog_min_ratio must be in (0, 1)')
+            if not 0.0 < self._tracking_min_feedback_rate_hz <= self._tracking_command_rate_hz:
+                raise ValueError('minimum_feedback_rate_hz must be within the control target')
             if self._tracking_max_target_lead_deg <= 0.0:
                 raise ValueError('max_target_lead_deg must be positive')
             if not (
@@ -247,6 +312,10 @@ class RaspberryPiDeviceServer:
             self._tracking_feedback_log_period_s = 1.0 / feedback_log_rate_hz
         except Exception as exc:
             print(f"[PSD分区高速][警告] 读取电机反馈配置失败，使用默认值: {exc}")
+        # ⚠ 这一句必须在 try 之外：配置读失败（文件缺失/键写错）时也要落到
+        #   配置的链路默认值，否则会静默退回 250Hz 而没有任何提示。
+        if self._motor_link_keepalive and self._motor_link_rate_hz > 0.0:
+            self._motor_tx_rate_hz = self._motor_link_rate_hz
         if self.motor_serial is not None:
             self._start_motor_rx_thread()
             self._start_motor_tx_thread()
@@ -255,6 +324,7 @@ class RaspberryPiDeviceServer:
             tracking_config,
             self._apply_tracking_step,
             self._hold_tracking_position,
+            self._wait_for_tracking_feedback_pair,
         )
 
     def _ensure_motor_defaults(self, motor):
@@ -421,10 +491,52 @@ class RaspberryPiDeviceServer:
         payload_hex = ''.join(format(byte, '02x') for byte in payload)
         return f"d{self._normalize_standard_can_id(canid)}{self.CANFD_DLC_16}{payload_hex}\r"
 
+    def _format_canfd_extended_command(self, canid, payload):
+        """Format a standard-ID CAN FD payload through the adapter's D command."""
+        length_to_dlc = {8: '8', 16: 'A'}
+        payload = bytes(payload)
+        if len(payload) not in length_to_dlc:
+            raise ValueError('Extended CANFD command requires 8 or 16 bytes')
+        standard_id = self._normalize_standard_can_id(canid)
+        return (
+            f"D{int(standard_id, 16):08X}{length_to_dlc[len(payload)]}"
+            f"{payload.hex().upper()}\r"
+        )
+
+    def _format_auto_upload_command(self, motor_id, enabled, variant=None):
+        if motor_id not in self.motors:
+            raise ValueError(f'Motor not initialized: {motor_id}')
+        if variant is None:
+            variant = self._motor_auto_upload_variants.get(
+                motor_id, 'canfd_extended_dlc8'
+            )
+        lengths = {
+            'canfd_extended_dlc8': 8,
+            'canfd_extended_dlc16_padded': 16,
+        }
+        if variant not in lengths:
+            raise ValueError(f'Unsupported auto-upload variant: {variant}')
+        payload = bytes((0x00, 0x06, int(bool(enabled)))) + bytes(
+            lengths[variant] - 3
+        )
+        return self._format_canfd_extended_command(
+            self.motors[motor_id]['canid'], payload
+        )
+
+    def _set_canfd_auto_upload(self, motor_id, enabled):
+        command = self._format_auto_upload_command(motor_id, enabled)
+        self.write_motor_data(command, flush=False)
+        self._motor_auto_upload_enabled[motor_id] = bool(enabled)
+
     def _send_canfd_motor_frame(self, motor, **kwargs):
         payload = self._build_canfd_payload(motor, **kwargs)
         command = self._format_canfd_command(motor['canid'], payload)
         self.write_motor_data(command)
+        # 手动单轴指令（初始化/使能/失能/切模式/置零/手动点动）与跟踪目标
+        # 是两条路。手动介入时先掐掉保活重发，否则它会在下一拍把跟踪目标
+        # 又写回去，把用户的手动操作盖掉。跟踪恢复时 _send_tracking_target_batch
+        # 会重新设置这个值。
+        self._motor_link_last_targets = None
         return command
 
     def _expected_slave_id(self, motor_id):
@@ -585,29 +697,377 @@ class RaspberryPiDeviceServer:
         self._motor_tx_thread.start()
         print(
             '[PSD分区高速] 电机目标发送线程已启动 | '
-            f'目标周期={1000.0 / self._motor_tx_rate_hz:.2f}ms '
+            f'发送周期={1000.0 / self._motor_tx_rate_hz:.2f}ms '
+            f'链路采样={self._motor_link_rate_hz:.0f}Hz/轴 '
+            f'保活重发={"开" if self._motor_link_keepalive else "关"} '
+            f'节流看门狗={"开" if self._motor_link_watchdog else "关"} | '
             '队列策略=仅保留最新双轴目标'
         )
 
+    def _link_keepalive_targets(self):
+        """保活要重复发送的那组目标；不该发时返回 None。
+
+        只有两个轴都处于位置模式才允许保活。原因：_send_tracking_target_batch
+        内部把模式硬编码成 POSITION，如果用户手动把某个轴切到速度/力矩模式，
+        保活会把它硬拽回位置模式，那是危险的。
+
+        motor['mode'] / motor['run'] 会被 _update_motor_state_from_feedback
+        用回传帧实时覆盖，所以这里读到的是电机的真实状态，不是我们的假设。
+        """
+        if not self._motor_link_keepalive:
+            return None
+        if self._motor_link_keepalive_pause_depth > 0:
+            return None
+        targets = self._motor_link_last_targets
+        if targets is None:
+            return None
+        for motor_id in ('motor1', 'motor2'):
+            motor = self.motors.get(motor_id)
+            if motor is None or motor_id not in targets:
+                return None
+            if self._mode_value(motor.get('mode')) != self.MOTOR_MODE_POSITION:
+                return None
+        return dict(targets)
+
+    def _pause_link_keepalive(self):
+        """临时停掉保活重发（测速/诊断期间用，避免污染测量结果）。可重入。"""
+        self._motor_link_keepalive_pause_depth += 1
+
+    def _resume_link_keepalive(self):
+        self._motor_link_keepalive_pause_depth = max(
+            0, self._motor_link_keepalive_pause_depth - 1
+        )
+        if self._motor_link_keepalive_pause_depth == 0:
+            # The TX worker owns rate windows. Its next slot resets the
+            # baseline, so a benchmark thread cannot race a window update.
+            self._motor_link_probe_reset_pending = True
+            self._motor_link_last_rates = {}
+            self._motor_link_last_rates_at = 0.0
+            self._motor_link_bounce_probe_until = 0.0
+            self._motor_link_limited_hz = None
+
+    def start_motor_link_sampling(self):
+        """重发本进程已下发的双轴位置目标，启动连续命令应答。
+
+        电机处于位置模式时本来就在保持这个目标；重发相同目标不改变设定
+        位置。不能使用过期的实测位置来构造一个新目标。
+        """
+        # 加锁顺序与 _hold_tracking_position 保持一致，避免与它相互等待。
+        with self._tracking_target_lock:
+            with self.motor_transaction_lock:
+                unready = [
+                    motor_id for motor_id in ('motor1', 'motor2')
+                    if motor_id not in self.motors
+                    or not bool(self.motors[motor_id].get('run', False))
+                    or self._mode_value(self.motors[motor_id].get('mode'))
+                    != self.MOTOR_MODE_POSITION
+                ]
+                if unready:
+                    raise RuntimeError(
+                        'Both motors must be enabled in position mode before '
+                        'link sampling: ' + ', '.join(unready)
+                    )
+                with self.motor_feedback_condition:
+                    missing = [
+                        motor_id for motor_id in ('motor1', 'motor2')
+                        if motor_id not in self.current_targets
+                        or motor_id not in self.current_positions
+                        or motor_id not in self._motor_feedback_timestamps
+                    ]
+                    if missing:
+                        raise RuntimeError(
+                            'No known commanded target and motor feedback; '
+                            'initialize and enable both motors: '
+                            + ', '.join(missing)
+                        )
+                    hold = {
+                        motor_id: round(float(self.current_targets[motor_id]), 6)
+                        for motor_id in ('motor1', 'motor2')
+                    }
+                if not all(math.isfinite(value) for value in hold.values()):
+                    raise RuntimeError('Motor hold targets must be finite')
+                with self.motor_feedback_condition:
+                    generations = {
+                        motor_id: self._motor_feedback_generation.get(motor_id, 0)
+                        for motor_id in ('motor1', 'motor2')
+                    }
+                if self._send_tracking_target_batch(hold, count_tracking=False) is None:
+                    raise RuntimeError('Motor link is busy; hold command was not sent')
+        if not self._wait_for_feedback_pair(generations, 0.5):
+            self.stop_motor_link_sampling()
+            raise RuntimeError('No fresh dual-axis command replies after hold command')
+        with self.motor_feedback_condition:
+            unready = [
+                motor_id for motor_id in ('motor1', 'motor2')
+                if not bool(self.motors[motor_id].get('run', False))
+                or self._mode_value(self.motors[motor_id].get('mode'))
+                != self.MOTOR_MODE_POSITION
+            ]
+        if unready:
+            self.stop_motor_link_sampling()
+            raise RuntimeError(
+                'Fresh motor feedback did not confirm enabled position mode: '
+                + ', '.join(unready)
+            )
+        return hold
+
+    def stop_motor_link_sampling(self):
+        """停掉保活重发（链路回到"只在有跟踪目标时才发"）。"""
+        self._motor_link_last_targets = None
+
+    def _bounce_motor_link(self):
+        """C + S8 + Y5 + O：关通道再开，复位适配器的 CAN 控制器。
+
+        实测（HO7213 + 机致原厂 USB-CANFD / CANable2 系）：发送速度快到把
+        适配器的 CAN 发送缓冲灌满之后，固件会进入被节流的状态，之后即使降速
+        也只能跑 ~1570 帧/秒，而且**不会自愈**。整段约 0.1s，短于
+        motor_feedback_stale_stop_s(0.5s)，所以跟踪过程中做也不会被判成失联。
+        """
+        try:
+            with self.motor_transaction_lock:
+                for command in ('C\r', 'S8\r', 'Y5\r', 'O\r'):
+                    self.write_motor_data(command)
+                    time.sleep(0.02)
+        except Exception as exc:
+            print(f'[CANFD链路][复位失败] {type(exc).__name__}: {exc}')
+
+    def _update_link_rate_window(self):
+        """每满 1 秒记一次"每轴实际收到多少帧/秒"。
+
+        看门狗和 get_link_metrics 共用这份结果，所以即使看门狗被关掉，
+        上位机仍然能查到当前真实链路速率。
+        返回 True 表示刚更新过（即跨过了一个 1 秒窗口）。
+        """
+        now = time.monotonic()
+        elapsed = now - self._motor_link_probe_at
+        if elapsed < 1.0:
+            return False
+        self._motor_link_probe_at = now
+        with self.motor_feedback_condition:
+            counts = dict(self._motor_rx_counts)
+        rates = {}
+        for motor_id in ('motor1', 'motor2'):
+            delta = counts.get(motor_id, 0) - self._motor_link_probe_counts.get(
+                motor_id, 0
+            )
+            rates[motor_id] = delta / elapsed
+        self._motor_link_probe_counts = counts
+        # 同一个窗口里也记"实际发出去多少批"。区分"发不出去"和"发出去但回不来"
+        # 全靠这个数（两者修法完全不同）。
+        tx_delta = self._motor_link_tx_batches - self._motor_link_probe_tx
+        self._motor_link_probe_tx = self._motor_link_tx_batches
+        self._motor_link_last_tx_hz = tx_delta / elapsed
+        self._motor_link_last_rates = rates
+        self._motor_link_last_window_s = elapsed
+        self._motor_link_last_rates_at = now
+        return True
+
+    def _reset_link_rate_window(self):
+        """Discard mixed windows after a benchmark, pause or adapter reset."""
+        self._motor_link_probe_at = time.monotonic()
+        with self.motor_feedback_condition:
+            self._motor_link_probe_counts = dict(self._motor_rx_counts)
+        self._motor_link_probe_tx = self._motor_link_tx_batches
+        self._motor_link_last_rates = {}
+        self._motor_link_last_tx_hz = 0.0
+        self._motor_link_last_rates_at = 0.0
+        self._motor_link_low_windows = 0
+
+    def _is_link_rate_low(self, rates):
+        """这一个窗口的反馈速率是否低于目标的可接受下限。"""
+        if not rates:
+            return False
+        floor = self._motor_tx_rate_hz * self._motor_link_watchdog_min_ratio
+        return min(rates.values()) < floor
+
+    def _service_link_watchdog(self):
+        """Judge RX loss only when the host actually sent at the target rate."""
+        if self._motor_link_probe_reset_pending:
+            self._reset_link_rate_window()
+            self._motor_link_probe_reset_pending = False
+            return
+        if not self._update_link_rate_window():
+            return
+        if not self._motor_link_watchdog or self._motor_link_keepalive_pause_depth:
+            return
+        now = self._motor_link_last_rates_at
+        # 链路本来就是空闲的（没在发目标）时不该有反馈，也就无从判断是否被节流。
+        if now - self._motor_link_last_send_at > 2.0:
+            self._motor_link_low_windows = 0
+            return
+        counts = self._motor_link_probe_counts
+        if not any(counts.get(motor_id, 0) for motor_id in ('motor1', 'motor2')):
+            return  # 从来没收到过反馈 -> 多半是没上电/没接线，别乱复位
+        rates = self._motor_link_last_rates
+        observed = min(rates.values())
+        floor = self._motor_tx_rate_hz * self._motor_link_watchdog_min_ratio
+
+        # A slow sender cannot prove that the adapter or motors are saturated.
+        if self._motor_link_last_tx_hz < floor:
+            self._motor_link_low_windows = 0
+            self._motor_link_bounce_probe_until = 0.0
+            self._motor_link_limited_hz = None
+            return
+
+        if observed >= floor:
+            self._motor_link_low_windows = 0
+            if self._motor_link_bounce_probe_until:
+                # 复位后速率回来了 -> 确认是节流
+                self._motor_link_bounce_probe_until = 0.0
+                if self._motor_link_limited_hz is not None:
+                    print('[CANFD链路] 复位后速率已恢复，判定为适配器节流，已恢复')
+                self._motor_link_limited_hz = None
+            return
+
+        # 复位刚做完，还在观察期内 -> 等它一会儿再下结论
+        if self._motor_link_bounce_probe_until:
+            if now < self._motor_link_bounce_probe_until:
+                return
+            self._motor_link_bounce_probe_until = 0.0
+            self._motor_link_limited_hz = observed
+            self._motor_link_limit_log_at = now
+            print(
+                '[CANFD链路][复位后仍丢反馈] '
+                f'回帧 {observed:.0f}Hz/轴，实发 '
+                f'{self._motor_link_last_tx_hz:.0f}Hz/轴，目标 '
+                f'{self._motor_tx_rate_hz:.0f}Hz/轴。'
+                '已停止反复复位；请用设定并行测速和 TX/RX 计数定位。'
+            )
+            return
+
+        # 已经知道"这个速率就是上限"了 -> 不再复位，只偶尔提醒一次
+        if self._motor_link_limited_hz is not None:
+            if observed >= self._motor_link_limited_hz * 0.75:
+                if now - self._motor_link_limit_log_at > 30.0:
+                    self._motor_link_limit_log_at = now
+                    print(
+                        '[CANFD链路][持续丢反馈] '
+                        f'{observed:.0f}Hz/轴（目标 {self._motor_tx_rate_hz:.0f}），'
+                        f'实发 {self._motor_link_last_tx_hz:.0f}Hz/轴，已跳过复位。'
+                    )
+                return
+            # 又明显掉了一截 -> 可能是新的卡死，允许再试一次复位
+            self._motor_link_limited_hz = None
+
+        self._motor_link_low_windows += 1
+        if self._motor_link_low_windows < 2:
+            return
+        self._motor_link_low_windows = 0
+        if now - self._motor_link_last_bounce_at < 5.0:
+            return
+        self._motor_link_last_bounce_at = now
+        self._motor_link_recoveries += 1
+        print(
+            '[CANFD链路][速率偏低] '
+            f'实测 {observed:.0f}Hz/轴 低于目标 {self._motor_tx_rate_hz:.0f}Hz 的 '
+            f'{self._motor_link_watchdog_min_ratio * 100:.0f}% '
+            f'-> 试一次复位 C+S8+Y5+O（第 {self._motor_link_recoveries} 次），'
+            f'3 秒后看是否恢复'
+        )
+        self._bounce_motor_link()
+        self._reset_link_rate_window()
+        self._motor_link_bounce_probe_until = time.monotonic() + 3.0
+
+    def _link_metrics_snapshot(self):
+        """给上位机看的链路体检结果（最近一个 1 秒窗口 + 累计计数）。"""
+        now = time.monotonic()
+        with self.motor_feedback_condition:
+            ages_ms = {
+                motor_id: (
+                    (now - self._motor_feedback_timestamps[motor_id]) * 1000.0
+                    if motor_id in self._motor_feedback_timestamps
+                    else None
+                )
+                for motor_id in ('motor1', 'motor2')
+            }
+        rates = dict(self._motor_link_last_rates)
+        return {
+            'link_rate_hz': self._motor_tx_rate_hz,
+            'window_s': round(self._motor_link_last_window_s, 4),
+            'window_age_s': round(now - self._motor_link_last_rates_at, 3)
+            if self._motor_link_last_rates_at else None,
+            'keepalive': bool(self._motor_link_keepalive),
+            'keepalive_armed': self._motor_link_last_targets is not None,
+            'watchdog': bool(self._motor_link_watchdog),
+            'watchdog_min_ratio': self._motor_link_watchdog_min_ratio,
+            'rx_hz': {
+                motor_id: round(rates.get(motor_id, 0.0), 1)
+                for motor_id in ('motor1', 'motor2')
+            },
+            'tx_batch_hz': round(self._motor_link_last_tx_hz, 1),
+            'tx_frame_hz': round(self._motor_link_last_tx_hz * 2.0, 1),
+            # rx/tx 比：≈1 = 链路跟得上；明显 <1 = 发出去的回不来（超速或丢帧）
+            'rx_over_tx': round(
+                (min(rates.values()) / self._motor_link_last_tx_hz)
+                if self._motor_link_last_tx_hz > 0 else 0.0, 3
+            ),
+            'feedback_age_ms': {
+                motor_id: (None if ages_ms[motor_id] is None
+                           else round(ages_ms[motor_id], 2))
+                for motor_id in ('motor1', 'motor2')
+            },
+            'serial_backlog_bytes': (
+                int(getattr(self.motor_serial, 'out_waiting', 0))
+                if self.motor_serial is not None else 0
+            ),
+            'last_write_ms': round(self._last_tracking_write_ms, 4),
+            'tx_timeouts': self._motor_tx_timeouts,
+            'tx_failures': self._motor_tx_failures,
+            'dropped_batches': self._motor_tx_dropped_batches,
+            'parse_errors': self._motor_rx_parse_errors,
+            'adapter_nacks': self._motor_adapter_nacks,
+            'recoveries': self._motor_link_recoveries,
+            # 看门狗判定"复位也救不回来"的那个速率（= 链路/电机的实际吞吐上限）
+            'rate_limited_hz': (
+                None if self._motor_link_limited_hz is None
+                else round(self._motor_link_limited_hz, 1)
+            ),
+            'software_build': self.SOFTWARE_BUILD,
+        }
+
+    def _sleep_until(self, deadline):
+        """睡到指定时刻；被停止事件打断时返回 False。
+
+        为什么不用 Event.wait 走所有间隔：Windows 上 Event.wait / Condition.wait
+        的粒度是系统时钟周期（实测 15.6ms），只有 time.sleep 能到 1~1.5ms。
+        Linux（RK3588）两者都是 hrtimer 精度，用 time.sleep 没有副作用。
+        长间隔仍然用 Event 等，这样停机时不用赖满整个周期。
+        """
+        delay = deadline - time.monotonic()
+        if delay <= 0.0:
+            return True
+        if delay > 0.01:
+            return not self._motor_tx_stop_event.wait(delay)
+        time.sleep(delay)
+        return True
+
     def _motor_tx_loop(self):
-        """Write at most one newest dual-axis target per configured TX slot."""
+        """按 _motor_tx_rate_hz 保持电机串口不停收发。
+
+        一个槽位做两件事：
+
+        1. 发目标。有新目标就发新的；没有新目标且保活开着，就把上一组目标
+           原样重发一次 —— 位置模式下发同一个设定值是空操作，这样反馈流就
+           不再受控制环节拍限制。控制器仍按 command_rate_hz 产出新目标，
+           链路采样率独立按 motor_link_rate_hz 走（默认每轴 290Hz）。
+        2. 看门狗。反馈速率塌了说明适配器被节流，复位通道把它救回来。
+        """
         period_s = 1.0 / self._motor_tx_rate_hz
         next_slot = time.monotonic()
         while not self._motor_tx_stop_event.is_set():
-            with self._motor_tx_condition:
-                while (
-                    self._tracking_tx_pending is None
-                    and not self._motor_tx_stop_event.is_set()
-                ):
-                    self._motor_tx_condition.wait(0.1)
+            # 完全没事可做时（保活关、或还没发过任何目标）就挂起等通知，
+            # 别用 1ms 空转烧 CPU。
+            if not self._link_keepalive_targets():
+                with self._motor_tx_condition:
+                    if self._tracking_tx_pending is None:
+                        self._motor_tx_condition.wait(0.05)
                 if self._motor_tx_stop_event.is_set():
                     break
 
             now = time.monotonic()
             if next_slot < now:
                 next_slot = now
-            delay = next_slot - now
-            if delay > 0.0 and self._motor_tx_stop_event.wait(delay):
+            if not self._sleep_until(next_slot):
                 break
 
             # Serialise against manual transactions and stop/hold.  Taking the
@@ -619,6 +1079,10 @@ class RaspberryPiDeviceServer:
                     self._tracking_tx_pending = None
                 if pending is not None:
                     generation, targets = pending
+                else:
+                    generation = self._tracking_tx_sent_generation
+                    targets = self._link_keepalive_targets()
+                if targets is not None:
                     try:
                         write_ms = self._send_tracking_target_batch(targets)
                     except Exception as exc:
@@ -635,9 +1099,11 @@ class RaspberryPiDeviceServer:
                             f'发送线程异常={self._motor_tx_last_error}'
                         )
                         write_ms = None
-                    if write_ms is not None:
+                    if write_ms is not None and pending is not None:
                         with self._motor_tx_condition:
                             self._tracking_tx_sent_generation = generation
+
+            self._service_link_watchdog()
 
             next_slot += period_s
             finished_at = time.monotonic()
@@ -672,6 +1138,9 @@ class RaspberryPiDeviceServer:
             raw_types = {}
             self._motor_rx_raw_types = raw_types
         raw_types[frame_prefix] = raw_types.get(frame_prefix, 0) + 1
+        capture = getattr(self, '_motor_diagnostic_capture', None)
+        if capture is not None and capture.record_rx(frame):
+            return  # Parameter replies are not motor position samples.
         matched = False
         for motor_id in tuple(self.motors):
             feedback = self.parse_motor_feedback(frame, motor_id)
@@ -693,6 +1162,29 @@ class RaspberryPiDeviceServer:
                 self.motor_feedback_condition.wait(remaining)
             feedback = self._latest_motor_feedback.get(motor_id)
             return dict(feedback) if isinstance(feedback, dict) else feedback
+
+    def _wait_for_tracking_feedback_pair(self, previous, timeout_s):
+        """Return only after both axes have supplied a new feedback sample."""
+        motor_ids = ('motor1', 'motor2')
+        deadline = time.monotonic() + max(float(timeout_s), 0.0)
+        with self.motor_feedback_condition:
+            while True:
+                generations = {
+                    motor_id: self._motor_feedback_generation.get(motor_id, 0)
+                    for motor_id in motor_ids
+                }
+                if previous is None:
+                    if all(generations.values()):
+                        return generations
+                elif all(
+                    generations[motor_id] > previous[motor_id]
+                    for motor_id in motor_ids
+                ):
+                    return generations
+                remaining = deadline - time.monotonic()
+                if remaining <= 0.0:
+                    return None
+                self.motor_feedback_condition.wait(remaining)
 
     def _send_canfd_motor_frame_and_read(self, motor_id, motor, timeout=0.3, **kwargs):
         """Send a command and wait for the next background-received sample.
@@ -786,6 +1278,9 @@ class RaspberryPiDeviceServer:
                     raise RuntimeError(
                         f'Incomplete motor serial write: {written}/{len(encoded)} bytes'
                     )
+                capture = getattr(self, '_motor_diagnostic_capture', None)
+                if capture is not None:
+                    capture.record_tx(data)
                 if flush:
                     self.motor_serial.flush()
 
@@ -858,6 +1353,16 @@ class RaspberryPiDeviceServer:
         self._last_tracking_write_ms = (time.monotonic() - started) * 1000.0
         for motor_id, target in targets.items():
             self.current_targets[motor_id] = float(target)
+        # 记下"最后一次真正写出去的目标"，保活重发用它。hold / 跟踪 / 测速
+        # 都走这个函数，所以保活永远复现的是最后一次真实指令，不会把 hold
+        # 之后的位置又拽回跟踪目标。
+        self._motor_link_last_targets = {
+            motor_id: float(targets[motor_id])
+            for motor_id in ('motor1', 'motor2')
+            if motor_id in targets
+        }
+        self._motor_link_last_send_at = time.monotonic()
+        self._motor_link_tx_batches += 1
         if count_tracking:
             self._tracking_tx_batches += 1
             self._tracking_tx_frames += 2
@@ -964,6 +1469,8 @@ class RaspberryPiDeviceServer:
             'serial_backlog_bytes': int(
                 getattr(self.motor_serial, 'out_waiting', 0)
             ) if self.motor_serial is not None else 0,
+            'link_rate_hz': self._motor_tx_rate_hz,
+            'link_recoveries': self._motor_link_recoveries,
         }
 
     def _check_tracking_feedback_freshness(self, metrics):
@@ -1392,6 +1899,47 @@ class RaspberryPiDeviceServer:
                 'A motor command reply is required before fast tracking: '
                 + ', '.join(missing_feedback)
             )
+        if self._tracking_control_clock == 'motor_feedback':
+            wrong_mode = [
+                motor_id for motor_id in ('motor1', 'motor2')
+                if self._mode_value(self.motors[motor_id].get('mode'))
+                != self.MOTOR_MODE_POSITION
+            ]
+            if wrong_mode:
+                return False, (
+                    'Switch both motors to position mode, then rearm link sampling: '
+                    + ', '.join(wrong_mode)
+                )
+            if self._motor_tx_rate_hz < self._tracking_command_rate_hz:
+                return False, (
+                    'Motor link target rate must be at least the control rate: '
+                    f'{self._motor_tx_rate_hz:.0f} < '
+                    f'{self._tracking_command_rate_hz:.0f} Hz'
+                )
+            if self._motor_link_last_targets is None:
+                return False, 'Arm motor link sampling before feedback-clock tracking'
+            with self.motor_feedback_condition:
+                stale = [
+                    motor_id for motor_id in ('motor1', 'motor2')
+                    if now - self._motor_feedback_timestamps[motor_id] > 0.050
+                ]
+            if stale:
+                return False, 'Motor feedback is not fresh: ' + ', '.join(stale)
+            if (
+                self._motor_link_last_window_s <= 0.0
+                or now - self._motor_link_last_rates_at > 1.5
+            ):
+                return False, 'Wait for a fresh 1 s motor link rate window before tracking'
+            observed_hz = min(
+                self._motor_link_last_rates.get(motor_id, 0.0)
+                for motor_id in ('motor1', 'motor2')
+            )
+            minimum_hz = self._tracking_min_feedback_rate_hz
+            if observed_hz < minimum_hz:
+                return False, (
+                    f'Motor feedback rate {observed_hz:.0f} Hz/axis is below '
+                    f'the required {minimum_hz:.0f} Hz/axis'
+                )
         return True, 'ready'
 
     def _apply_tracking_step(
@@ -1414,9 +1962,6 @@ class RaspberryPiDeviceServer:
                     motor_id: float(self.current_positions[motor_id])
                     for motor_id in ('motor1', 'motor2')
                 }
-            if reset_accumulator:
-                for motor_id in ('motor1', 'motor2'):
-                    self._tracking_requested_targets[motor_id] = feedback_positions[motor_id]
             axis_plan = (
                 ('motor1', 'pitch', float(pitch_delta)),
                 ('motor2', 'yaw', float(yaw_delta)),
@@ -1425,23 +1970,16 @@ class RaspberryPiDeviceServer:
             sent_axes = []
             for motor_id, axis_name, delta in axis_plan:
                 feedback_position = feedback_positions[motor_id]
-                previous_target = float(
-                    self._tracking_requested_targets.get(
-                        motor_id,
-                        self.current_targets.get(motor_id, feedback_position),
-                    )
-                )
-                if abs(delta) < 1e-12:
-                    targets[motor_id] = previous_target
-                    continue
-
-                targets[motor_id] = bounded_accumulated_target(
-                    previous_target,
+                # A fresh paired motor reply invalidates every earlier PSD
+                # increment, including targets still waiting in the TX slot.
+                # Only the current PSD correction is applied to this feedback.
+                targets[motor_id] = feedback_relative_target(
                     feedback_position,
                     delta,
                     target_lead,
                 )
-                sent_axes.append(axis_name)
+                if abs(delta) >= 1e-12:
+                    sent_axes.append(axis_name)
 
             queue_ms = self._queue_tracking_target_batch(targets)
             pitch_target = targets['motor1']
@@ -1503,6 +2041,7 @@ class RaspberryPiDeviceServer:
                     f"写超时={metrics['tx_timeouts']} "
                     f"写异常={metrics['tx_failures']} "
                     f"丢弃={metrics['dropped_batches']} "
+                    f"链路节流复位={metrics['link_recoveries']} "
                     f"解析错误={metrics['parse_errors']}"
                 )
             return pitch_target, yaw_target
@@ -1525,11 +2064,21 @@ class RaspberryPiDeviceServer:
                 )
                 return hold_targets['motor1'], hold_targets['motor2']
 
-    def _benchmark_psd_until(self, reader, started_at, deadline):
+    def _benchmark_psd_until(self, reader, started_at, deadline, target_rate_hz=None):
         samples = 0
+        period_s = 0.0 if target_rate_hz is None else 1.0 / float(target_rate_hz)
+        next_slot = started_at
         while time.monotonic() < deadline:
+            if period_s > 0.0:
+                delay = next_slot - time.monotonic()
+                if delay > 0.0:
+                    time.sleep(delay)
+                if time.monotonic() >= deadline:
+                    break
             reader.read_sample()
             samples += 1
+            if period_s > 0.0:
+                next_slot = max(next_slot + period_s, time.monotonic())
         elapsed = max(time.monotonic() - started_at, 1e-9)
         return {
             'samples': samples,
@@ -1551,46 +2100,42 @@ class RaspberryPiDeviceServer:
                 self.motor_feedback_condition.wait(remaining)
         return True
 
-    def _benchmark_motor_until(self, targets, started_at, deadline):
-        sent_pairs = 0
-        completed_pairs = 0
-        feedback_timeouts = 0
-        consecutive_timeouts = 0
+    def _benchmark_motor_until(
+        self, targets, started_at, deadline, target_rate_hz=None
+    ):
+        """尽量快地把目标灌进去，不再逐对等待反馈。
+
+        旧版是"发一对 -> 等这一对的反馈"，于是实测值被单次往返延迟锁死
+        （实测约 0.6ms，天花板 ~1570 帧/秒 = 785 对/秒），会让人误判成硬件上限。
+        实际上总线上一帧只占约 200us，延迟是软件侧造成的。这里改成发完就走、
+        由独立的 RX 线程记账，量出来的才是真实吞吐。
+        """
         with self.motor_feedback_condition:
             rx_baseline = {
                 motor_id: self._motor_rx_counts.get(motor_id, 0)
                 for motor_id in ('motor1', 'motor2')
             }
-
+        sent_pairs = 0
+        period_s = 0.0 if target_rate_hz is None else 1.0 / float(target_rate_hz)
+        next_slot = started_at
         while time.monotonic() < deadline:
+            if period_s > 0.0:
+                delay = next_slot - time.monotonic()
+                if delay > 0.0:
+                    time.sleep(delay)
+                if time.monotonic() >= deadline:
+                    break
             with self.motor_transaction_lock:
-                with self.motor_feedback_condition:
-                    generations = {
-                        motor_id: self._motor_feedback_generation.get(motor_id, 0)
-                        for motor_id in ('motor1', 'motor2')
-                    }
                 write_ms = self._send_tracking_target_batch(
                     targets,
                     count_tracking=False,
                 )
-                if write_ms is None:
-                    next_command_at += command_period_s
-                    time.sleep(min(0.001, command_period_s))
-                    continue
-                sent_pairs += 1
-                remaining = deadline - time.monotonic()
-                received = self._wait_for_feedback_pair(
-                    generations,
-                    min(max(remaining, 0.0), 0.050),
-                )
-            if received:
-                completed_pairs += 1
-                consecutive_timeouts = 0
-            else:
-                feedback_timeouts += 1
-                consecutive_timeouts += 1
-                if consecutive_timeouts >= 3:
-                    break
+            if write_ms is None:
+                time.sleep(0.0005)
+                continue
+            sent_pairs += 1
+            if period_s > 0.0:
+                next_slot = max(next_slot + period_s, time.monotonic())
 
         elapsed = max(time.monotonic() - started_at, 1e-9)
         with self.motor_feedback_condition:
@@ -1601,10 +2146,13 @@ class RaspberryPiDeviceServer:
                 )
                 for motor_id in ('motor1', 'motor2')
             }
+        # 一次问答要两轴都回来才算"完成一对"，所以取两侧的较小值。
+        completed_pairs = min(rx_frames.values()) if rx_frames else 0
         return {
+            'mode': 'pipelined',
             'sent_pairs': sent_pairs,
             'completed_pairs': completed_pairs,
-            'feedback_timeouts': feedback_timeouts,
+            'feedback_timeouts': 0,
             'elapsed_s': round(elapsed, 6),
             'tx_pair_hz': round(sent_pairs / elapsed, 1),
             'completed_pair_hz': round(completed_pairs / elapsed, 1),
@@ -2338,6 +2886,9 @@ class RaspberryPiDeviceServer:
         if not self._rate_benchmark_lock.acquire(blocking=False):
             raise RuntimeError('Another motor diagnostic is already running')
 
+        with self.motor_transaction_lock:
+            self._pause_link_keepalive()
+
         original_targets = {}
         results = {}
         try:
@@ -2481,6 +3032,7 @@ class RaspberryPiDeviceServer:
                             count_tracking=False,
                         )
             finally:
+                self._resume_link_keepalive()
                 self._rate_benchmark_lock.release()
 
     def _observe_upload_phase(self, motor_id, command, duration_s, parameter_index=None):
@@ -2638,117 +3190,152 @@ class RaspberryPiDeviceServer:
         return result
 
     def _run_safe_rate_benchmark(self, duration_s):
-        """Measure uncapped throughput while both motors hold position."""
+        """Measure peak throughput and verify configured concurrent rates."""
         duration_s = float(duration_s)
         if not 0.5 <= duration_s <= 10.0:
             raise ValueError('benchmark duration_s must be between 0.5 and 10.0')
         if self.tracking_service.is_running:
             raise RuntimeError('Stop PSD tracking before running the benchmark')
-        ready, message = self._tracking_preflight()
-        if not ready:
-            raise RuntimeError(message)
-        now = time.monotonic()
-        with self.motor_feedback_condition:
-            stale_feedback = [
-                motor_id
-                for motor_id in ('motor1', 'motor2')
-                if now - self._motor_feedback_timestamps.get(motor_id, 0.0) > 2.0
-            ]
-        if stale_feedback:
-            raise RuntimeError(
-                'Query both motor positions immediately before benchmark: '
-                + ', '.join(stale_feedback)
-            )
-        wrong_mode = [
-            motor_id
-            for motor_id in ('motor1', 'motor2')
-            if self._mode_value(self.motors[motor_id].get('mode'))
-            != self.MOTOR_MODE_POSITION
-        ]
-        if wrong_mode:
-            raise RuntimeError(
-                'Benchmark requires position mode: ' + ', '.join(wrong_mode)
-            )
         if not self._rate_benchmark_lock.acquire(blocking=False):
             raise RuntimeError('A rate benchmark is already running')
 
         reader = None
+        was_armed = self._motor_link_last_targets is not None
+        was_watchdog = self._motor_link_watchdog
+        self._motor_link_watchdog = False
+        paused = False
         try:
+            if self.motor_serial is None or not self.motor_serial.is_open:
+                raise RuntimeError('Motor serial port is not available')
+            if self._motor_rx_thread is None or not self._motor_rx_thread.is_alive():
+                raise RuntimeError('Motor feedback receiver thread is not running')
+            if self._motor_tx_thread is None or not self._motor_tx_thread.is_alive():
+                raise RuntimeError('Motor target sender thread is not running')
+            # 重发先前已下发的位置目标并等一对新反馈，不要求测试前已经达到
+            # 设定频率；测速的目的正是测出这个上限。
+            hold_targets = self.start_motor_link_sampling()
+            # 测速期间停掉链路保活，避免 TX 线程抢占串口。
+            self._pause_link_keepalive()
+            paused = True
             with self._tracking_target_lock:
-                with self.motor_feedback_condition:
-                    hold_targets = {
-                        motor_id: round(float(self.current_positions[motor_id]), 6)
-                        for motor_id in ('motor1', 'motor2')
-                    }
                 with self._motor_tx_condition:
                     self._tracking_tx_pending = None
                     self._tracking_requested_targets.update(hold_targets)
-                self._send_tracking_target_batch(
-                    hold_targets,
-                    count_tracking=False,
-                )
 
             config = json.loads(
                 Path(__file__).with_name('psd_calibration.json').read_text(
                     encoding='utf-8'
                 )
             )
+            control = config['controller']
+            psd_target_hz = float(control['sample_rate_hz'])
+            motor_target_hz = float(control['motor_link_rate_hz'])
+            minimum_motor_hz = float(control['minimum_feedback_rate_hz'])
+            acquisition_backend = control.get('acquisition_backend', 'thread')
 
-            reader = PsdTrackingService._build_reader(config)
-            reader.open()
-            psd_started = time.monotonic()
-            psd_only = self._benchmark_psd_until(
-                reader,
-                psd_started,
-                psd_started + duration_s,
-            )
-            reader.close()
-            reader = None
-
-            motor_started = time.monotonic()
-            motor_only = self._benchmark_motor_until(
-                hold_targets,
-                motor_started,
-                motor_started + duration_s,
-            )
-
-            reader = PsdTrackingService._build_reader(config)
-            reader.open()
-            combined_started = time.monotonic()
-            combined_deadline = combined_started + duration_s
-            psd_result = {}
-            psd_error = []
-
-            def combined_psd_loop():
+            def run_process_phase(psd_rate_hz=None, motor_rate_hz=None,
+                                  motor_enabled=True):
+                process = PsdAcquisitionProcess(config, psd_rate_hz)
+                process.start()
                 try:
-                    psd_result.update(
-                        self._benchmark_psd_until(
-                            reader,
-                            combined_started,
-                            combined_deadline,
+                    started = time.monotonic()
+                    initial_samples = process.snapshot()['samples']
+                    deadline = started + duration_s
+                    motor_result = None
+                    if motor_enabled:
+                        motor_result = self._benchmark_motor_until(
+                            hold_targets, started, deadline, motor_rate_hz,
                         )
-                    )
-                except Exception as exc:
-                    psd_error.append(exc)
+                    else:
+                        time.sleep(duration_s)
+                    process_error = process.error()
+                    if process_error:
+                        raise RuntimeError(process_error)
+                    psd_snapshot = process.snapshot()
+                    samples = psd_snapshot['samples'] - initial_samples
+                    elapsed = max(time.monotonic() - started, 1e-9)
+                    return {
+                        'samples': samples,
+                        'elapsed_s': round(elapsed, 6),
+                        'sample_hz': round(samples / elapsed, 1),
+                        'backend': 'process',
+                        'adc_read_mean_ms': round(
+                            psd_snapshot['adc_read_mean_ms'], 4,
+                        ),
+                        'adc_read_max_ms': round(
+                            psd_snapshot['adc_read_max_ms'], 4,
+                        ),
+                        'adc_schedule_overruns': psd_snapshot['adc_schedule_overruns'],
+                        'adc_timeouts': psd_snapshot['adc_timeouts'],
+                    }, motor_result
+                finally:
+                    process.stop()
 
-            psd_thread = threading.Thread(
-                target=combined_psd_loop,
-                name='safe-rate-benchmark-psd',
-                daemon=True,
-            )
-            psd_thread.start()
-            combined_motor = self._benchmark_motor_until(
-                hold_targets,
-                combined_started,
-                combined_deadline,
-            )
-            psd_thread.join(duration_s + 1.0)
-            if psd_thread.is_alive():
-                raise RuntimeError('Combined PSD benchmark thread did not stop')
-            if psd_error:
-                raise psd_error[0]
-            reader.close()
-            reader = None
+            def run_parallel(psd_rate_hz=None, motor_rate_hz=None):
+                phase_reader = PsdTrackingService._build_reader(config)
+                phase_reader.open()
+                started = time.monotonic()
+                deadline = started + duration_s
+                psd_result = {}
+                psd_error = []
+
+                def read_psd():
+                    try:
+                        psd_result.update(self._benchmark_psd_until(
+                            phase_reader, started, deadline, psd_rate_hz,
+                        ))
+                    except Exception as exc:
+                        psd_error.append(exc)
+
+                psd_thread = threading.Thread(
+                    target=read_psd,
+                    name='motor-psd-rate-benchmark',
+                    daemon=True,
+                )
+                psd_thread.start()
+                try:
+                    motor_result = self._benchmark_motor_until(
+                        hold_targets, started, deadline, motor_rate_hz,
+                    )
+                finally:
+                    psd_thread.join(duration_s + 1.0)
+                    if not psd_thread.is_alive():
+                        phase_reader.close()
+                if psd_thread.is_alive():
+                    raise RuntimeError('Combined PSD benchmark thread did not stop')
+                if psd_error:
+                    raise psd_error[0]
+                return psd_result, motor_result
+
+            if acquisition_backend == 'process':
+                psd_only, _ = run_process_phase(motor_enabled=False)
+                configured_psd, configured_motor = run_process_phase(
+                    psd_target_hz, motor_target_hz,
+                )
+                motor_started = time.monotonic()
+                motor_only = self._benchmark_motor_until(
+                    hold_targets, motor_started, motor_started + duration_s,
+                )
+                psd_result, combined_motor = run_process_phase()
+            else:
+                reader = PsdTrackingService._build_reader(config)
+                reader.open()
+                psd_started = time.monotonic()
+                psd_only = self._benchmark_psd_until(
+                    reader,
+                    psd_started,
+                    psd_started + duration_s,
+                )
+                reader.close()
+                reader = None
+                configured_psd, configured_motor = run_parallel(
+                    psd_target_hz, motor_target_hz,
+                )
+                motor_started = time.monotonic()
+                motor_only = self._benchmark_motor_until(
+                    hold_targets, motor_started, motor_started + duration_s,
+                )
+                psd_result, combined_motor = run_parallel()
 
             # Reassert the same hold target after the stress test.
             with self.motor_transaction_lock:
@@ -2758,18 +3345,34 @@ class RaspberryPiDeviceServer:
                 )
 
             result = {
+                'software_build': self.SOFTWARE_BUILD,
                 'safe_hold_targets_deg': hold_targets,
                 'phase_duration_s': duration_s,
                 'psd_only': psd_only,
                 'motor_only': motor_only,
+                'configured': {
+                    'psd_target_hz': psd_target_hz,
+                    'motor_target_hz': motor_target_hz,
+                    'minimum_motor_feedback_hz': minimum_motor_hz,
+                    'psd': configured_psd,
+                    'motor': configured_motor,
+                    'meets_target': (
+                        configured_psd['sample_hz'] >= psd_target_hz * 0.95
+                        and configured_motor['completed_pair_hz'] >= minimum_motor_hz
+                    ),
+                },
                 'combined': {
                     'psd': psd_result,
                     'motor': combined_motor,
                 },
             }
             print(
-                '[安全测速][结果] '
+                '[频率测试][结果] '
                 f"PSD单独={psd_only['sample_hz']:.1f}Hz | "
+                f"设定并行PSD/电机TX/RX="
+                f"{configured_psd['sample_hz']:.1f}/"
+                f"{configured_motor['tx_pair_hz']:.1f}/"
+                f"{configured_motor['completed_pair_hz']:.1f}Hz | "
                 f"电机单独TX/RX={motor_only['tx_pair_hz']:.1f}/"
                 f"{motor_only['completed_pair_hz']:.1f}Hz | "
                 f"同时PSD={psd_result['sample_hz']:.1f}Hz "
@@ -2783,6 +3386,11 @@ class RaspberryPiDeviceServer:
                     reader.close()
                 except Exception:
                     pass
+            if paused:
+                self._resume_link_keepalive()
+            if not was_armed:
+                self.stop_motor_link_sampling()
+            self._motor_link_watchdog = was_watchdog
             self._rate_benchmark_lock.release()
 
     def _start_motor_position_step_test_async(self, command):
@@ -2904,6 +3512,52 @@ class RaspberryPiDeviceServer:
 
     def handle_tracking_command(self, command):
         action = command.get('action')
+        if action == 'get_link_metrics':
+            try:
+                return {
+                    'device': 'tracking',
+                    'action': action,
+                    'status': 'success',
+                    'message': 'Motor CANFD link metrics',
+                    'data': self._link_metrics_snapshot(),
+                }
+            except Exception as exc:
+                return {
+                    'device': 'tracking',
+                    'action': action,
+                    'status': 'error',
+                    'message': f'{type(exc).__name__}: {exc}',
+                }
+        if action == 'set_link_sampling':
+            # 兼容旧上位机的手动链路命令；新界面通过测速或跟踪自动启动。
+            try:
+                if bool(command.get('on', True)):
+                    hold = self.start_motor_link_sampling()
+                    return {
+                        'device': 'tracking',
+                        'action': action,
+                        'status': 'success',
+                        'message': (
+                            'Motor link sampling armed; '
+                            'repeating last commanded position at link rate'
+                        ),
+                        'data': {'on': True, 'hold_targets_deg': hold},
+                    }
+                self.stop_motor_link_sampling()
+                return {
+                    'device': 'tracking',
+                    'action': action,
+                    'status': 'success',
+                    'message': 'Motor link sampling stopped',
+                    'data': {'on': False},
+                }
+            except Exception as exc:
+                return {
+                    'device': 'tracking',
+                    'action': action,
+                    'status': 'error',
+                    'message': f'{type(exc).__name__}: {exc}',
+                }
         if action == 'test_canfd_auto_upload':
             try:
                 duration_s = float(command.get('duration_s', 1.0))
@@ -2970,7 +3624,7 @@ class RaspberryPiDeviceServer:
                     'device': 'tracking',
                     'action': action,
                     'status': 'success',
-                    'message': 'Safe uncapped rate benchmark completed',
+                    'message': 'PSD and dual-axis motor maximum rate benchmark completed',
                     'data': result,
                 }
             except Exception as exc:
@@ -3002,6 +3656,45 @@ class RaspberryPiDeviceServer:
                     ),
                     'data': self.tracking_service.status(),
                 }
+            if self._tracking_control_clock == 'motor_feedback':
+                now = time.monotonic()
+                armed_at = None
+                with self.motor_feedback_condition:
+                    feedback_stale = any(
+                        now - self._motor_feedback_timestamps.get(motor_id, 0.0)
+                        > 0.050
+                        for motor_id in ('motor1', 'motor2')
+                    )
+                if self._motor_link_last_targets is None or feedback_stale:
+                    try:
+                        armed_at = time.monotonic()
+                        self.start_motor_link_sampling()
+                    except Exception as exc:
+                        return {
+                            'device': 'tracking', 'action': action,
+                            'status': 'error',
+                            'message': f'Unable to start motor feedback: {exc}',
+                            'data': self.tracking_service.status(),
+                        }
+                # 等至少一个启动后的完整窗口达到要求。首个窗口可能包含
+                # 从空闲切入采样的时间，允许后续窗口稳定后再判定。
+                minimum_hz = self._tracking_min_feedback_rate_hz
+                deadline = time.monotonic() + 3.2
+                while time.monotonic() < deadline:
+                    window_ready = (
+                        self._motor_link_last_window_s >= 0.9
+                        and time.monotonic() - self._motor_link_last_rates_at <= 1.5
+                        and (
+                            armed_at is None
+                            or self._motor_link_last_rates_at > armed_at
+                        )
+                    )
+                    if window_ready and min(
+                        self._motor_link_last_rates.get(motor_id, 0.0)
+                        for motor_id in ('motor1', 'motor2')
+                    ) >= minimum_hz:
+                        break
+                    time.sleep(0.02)
             ready, message = self._tracking_preflight()
             if not ready:
                 return {
