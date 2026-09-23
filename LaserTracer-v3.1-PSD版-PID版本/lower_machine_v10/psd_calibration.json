@@ -1,0 +1,183 @@
+{
+  "schema_version": 1,
+  "description": "Version 10 500 Hz PSD / 250 Hz control, stage-1 increased outer-loop P with prediction and damping disabled",
+  "coordinate_order": {
+    "psd": [
+      "x_norm",
+      "y_norm"
+    ],
+    "motor": [
+      "pitch_deg",
+      "yaw_deg"
+    ]
+  },
+  "dark_offsets_v": {
+    "x": -0.0055,
+    "y": 0.0158,
+    "sum": 0.0608
+  },
+  "hardware": {
+    "spi_bus": 0,
+    "spi_device": 0,
+    "spi_speed_hz": 2000000,
+    "gpiochip": "/dev/gpiochip3",
+    "busy_line": 28,
+    "convst_line": 6,
+    "reset_line": 15,
+    "busy_timeout_s": 0.002,
+    "strict_busy": true
+  },
+  "linearization_reference_motor_deg": {
+    "pitch": -0.052,
+    "yaw": -0.242
+  },
+  "tracking_setpoint_norm": {
+    "x": 0.0339333867,
+    "y": 0.0143613248,
+    "source": "fixed mean of five manually optical-centered calibration captures; runtime center learning disabled",
+    "provisional": false
+  },
+  "forward_model": {
+    "formula": "psd_delta = jacobian_norm_per_deg * motor_delta_deg",
+    "jacobian_norm_per_deg": [
+      [
+        -2.3271442246,
+        -1.7362436168
+      ],
+      [
+        1.9370297975,
+        -2.3272536220
+      ]
+    ]
+  },
+  "inverse_model": {
+    "formula": "motor_correction_deg = correction_deg_per_norm * (measured_norm - tracking_setpoint_norm)",
+    "inverse_deg_per_norm": [
+      [
+        -0.2650929323,
+        0.1977721324
+      ],
+      [
+        -0.2206432956,
+        -0.2650804710
+      ]
+    ],
+    "correction_deg_per_norm": [
+      [
+        0.2650929323,
+        -0.1977721324
+      ],
+      [
+        0.2206432956,
+        0.2650804710
+      ]
+    ]
+  },
+  "signal_at_reference": {
+    "sum_mean_v": 1.7959263231,
+    "sum_between_run_std_v": 0.0249175697,
+    "x_between_run_std": 0.0021798143,
+    "y_between_run_std": 0.0012848748
+  },
+  "fit_quality": {
+    "point_count": 21,
+    "center_repeat_count": 5,
+    "samples_per_point_approx": 500,
+    "discard_initial_samples": 50,
+    "valid_fraction": 1.0,
+    "busy_completion_fraction": 1.0,
+    "rmse_norm": {
+      "x": 0.0023102403,
+      "y": 0.0014003132
+    },
+    "r_squared": {
+      "x": 0.9669963361,
+      "y": 0.9887017428
+    },
+    "condition_number": 1.0701008785
+  },
+  "commissioning_limits": {
+    "deadband_norm": {
+      "x": 0.012,
+      "y": 0.012
+    },
+    "max_single_correction_deg": 0.030,
+    "sum_min_v": 0.2,
+    "sum_max_v": 4.5
+  },
+  "controller": {
+    "sample_rate_hz": 500.0,
+    "command_rate_hz": 250.0,
+    "motor_link_rate_hz": 1000.0,
+    "motor_link_keepalive": true,
+    "motor_link_watchdog": true,
+    "motor_link_watchdog_min_ratio": 0.9,
+    "position_step_reference_rate_hz": 200.0,
+    "status_update_rate_hz": 5.0,
+    "status_log_rate_hz": 1.0,
+    "motion_log_rate_hz": 1.0,
+    "filter_alpha": 0.18,
+    "release_deadband_multiplier": 2.0,
+    "release_confirm_samples": 16,
+    "lock_confirm_samples": 8,
+    "acquire_valid_samples": 5,
+    "lost_after_invalid_samples": 20,
+    "max_consecutive_adc_timeouts": 5,
+    "motor_step_deg": 0.001,
+    "axis_command_threshold_deg": 0.00045,
+    "proportional_gain": 0.55,
+    "max_target_lead_deg": 0.040,
+    "reversal_brake_s": 0.025,
+    "reversal_min_step_deg": 0.010,
+    "reversal_confirm_commands": 3,
+    "reversal_cosine_threshold": -0.50,
+    "hold_min_interval_s": 0.300,
+    "center_hold_min_interval_s": 0.250,
+    "prediction_horizon_s": 0.000,
+    "derivative_alpha": 0.08,
+    "max_prediction_deadband_multiple": 3.0,
+    "prediction_min_error_ratio": 4.0,
+    "prediction_full_error_ratio": 8.0,
+    "prediction_confirm_samples": 3,
+    "prediction_min_rate_norm_s": 0.20,
+    "damping_horizon_s": 0.000,
+    "max_damping_deadband_multiple": 1.5,
+    "position_zones": {
+      "fine": {
+        "max_error_ratio": 2.5,
+        "proportional_gain": 0.08,
+        "max_correction_deg": 0.001,
+        "max_target_lead_deg": 0.001,
+        "min_target_lead_deg": 0.001,
+        "full_lead_error_ratio": 2.5,
+        "command_rate_hz": 250.0,
+        "reset_target_each_command": true
+      },
+      "medium": {
+        "max_error_ratio": 4.0,
+        "proportional_gain": 0.35,
+        "max_correction_deg": 0.006,
+        "max_target_lead_deg": 0.012,
+        "min_target_lead_deg": 0.003,
+        "full_lead_error_ratio": 4.0,
+        "command_rate_hz": 250.0,
+        "reset_target_each_command": true
+      },
+      "far": {
+        "proportional_gain": 0.55,
+        "max_correction_deg": 0.030,
+        "max_target_lead_deg": 0.040,
+        "min_target_lead_deg": 0.010,
+        "full_lead_error_ratio": 12.0,
+        "command_rate_hz": 250.0,
+        "reset_target_each_command": false
+      }
+    },
+    "motor_feedback_poll_s": 0.0005,
+    "motor_feedback_log_rate_hz": 1.0,
+    "motor_feedback_stale_warn_s": 0.050,
+    "motor_feedback_stale_stop_s": 0.500,
+    "motor_serial_backlog_drop_bytes": 512,
+    "motor_serial_timeout_backoff_s": 0.020
+  }
+}

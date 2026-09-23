@@ -1,0 +1,6 @@
+PySide6
+numpy
+pyserial
+opencv-python
+matplotlib
+scipy
